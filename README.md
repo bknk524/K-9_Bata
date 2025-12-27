@@ -75,6 +75,8 @@ pip install "torch>=2.6.0"
 streamlit run .\app\ui_app.py
 ```
 
-
-
+DB初期化
+```bash
+Remove-Item -Recurse -Force .\data\chroma_store
+```
 
