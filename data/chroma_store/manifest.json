@@ -1,0 +1,50 @@
+{
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\001_business_introduction.pptx": {
+    "sha256": "6be631788750cca7e3c8dbf9d46c0d43dd7b777afc020ad19f4138a4e2c0c482",
+    "mtime": 1766832099.4598842,
+    "ext": ".pptx",
+    "chunks": 2
+  },
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\001_reduction2.pptx": {
+    "sha256": "0791a5bcbb083209113813aafb21f11ec7142a04a9ca3d7ba23c29b7e151cc3d",
+    "mtime": 1766832129.2667282,
+    "ext": ".pptx",
+    "chunks": 2
+  },
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\001_synergy3.pptx": {
+    "sha256": "bf6f6bad5eff50a779881450a64b471a4705efe76462d0cecf4461c7d3145758",
+    "mtime": 1766832149.1466835,
+    "ext": ".pptx",
+    "chunks": 2
+  },
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\2_AlphaZeroの全体像.pdf": {
+    "sha256": "58d9f208e71408a0f115ea2d17bce6ea330e4216f2fb424205bea031eaeb3d8e",
+    "mtime": 1766832480.022558,
+    "ext": ".pdf",
+    "chunks": 1
+  },
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\Aリスク管理表.xlsx": {
+    "sha256": "94f11c6385b3348f53d606b5ada4b356eea0c35b57b1c638251671db53a6a00d",
+    "mtime": 1766832415.623867,
+    "ext": ".xlsx",
+    "chunks": 3
+  },
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\K-9Project team_C.pptx": {
+    "sha256": "fc22cab1d301b1c51e888a7c10404bf7eeb62b32b0003e92ca2418ff5ca30d17",
+    "mtime": 1765441216.0113559,
+    "ext": ".pptx",
+    "chunks": 1
+  },
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\TF51de1e5f-e0e8-4dd0-99f3-5b7584f7abdce33ea835_wac-8c9a99e312af.pptx": {
+    "sha256": "8ad00e3347cf4f983fda37832b42f843ceb7b849c97227599818511a82359fb0",
+    "mtime": 1766832642.909158,
+    "ext": ".pptx",
+    "chunks": 2
+  },
+  "C:\\Users\\sl2ca\\ドキュメント\\K-9_Bata\\data\\documents\\モンテカルロ木探索(monte_carlo_tree_search.py).pdf": {
+    "sha256": "7d2e598d79c44f7a695616db4cdb31ac9183df9b08f923766d5526df112ef411",
+    "mtime": 1766832470.4258752,
+    "ext": ".pdf",
+    "chunks": 2
+  }
+}
