@@ -48,7 +48,7 @@ def s() -> AppSettings:
 
 
 with st.sidebar:
-    st.header("設定（あとから変更可能）")
+    st.header("設定")
 
     # docs_dir（Explorer選択）
     c1, c2 = st.columns([3, 1])
