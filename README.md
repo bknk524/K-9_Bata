@@ -59,7 +59,7 @@ venv\Scripts\activate
 ```
 3.依存インストール（Torch以外）
 ```bash
-pip install -r requirements
+pip install -r requirements.txt
 ```
 4.Torch のインストール（CPU / GPU）
 cpu
