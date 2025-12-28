@@ -49,6 +49,10 @@ local-doc-search/
 ```
 <h1>初回起動手順</h1>
 
+0.Visual Studioのインストール<br>
+<a href= "https://visualstudio.microsoft.com/ja/downloads/">MSダウンロードページ</a>
+インストール時にC++ によるデスクトップ開発にチェックを入れてインストール
+
 1.venvインストール
 ```bash
 py -3.12 -m venv venv
