@@ -72,7 +72,7 @@ pip install "torch==2.9.1"
 ```
 gpu現状確認できず選定必要
 ```bash
-pip install "torch>=2.6.0"
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 ```
 6.起動
 ```bash
