@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 import json
 
@@ -14,9 +14,6 @@ class AppSettings:
 
     # Chroma
     collection: str = "office_index"
-
-    # Embedding
-    model_name: str = "BAAI/bge-m3"
 
     # Chunk
     chunk_size: int = 900
@@ -34,7 +31,9 @@ class AppSettings:
     def load(path: Path = DEFAULT_SETTINGS_PATH) -> "AppSettings":
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
-            return AppSettings(**data)
+            valid_fields = {field.name for field in fields(AppSettings)}
+            filtered = {key: value for key, value in data.items() if key in valid_fields}
+            return AppSettings(**filtered)
         return AppSettings()
 
     def save(self, path: Path = DEFAULT_SETTINGS_PATH) -> None:

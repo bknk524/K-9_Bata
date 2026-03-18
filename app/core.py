@@ -15,9 +15,18 @@ from pptx import Presentation
 import openpyxl
 from pypdf import PdfReader
 
+from app.embedding_model import load_embedding_model_name
 from app.settings import AppSettings
 
 SUPPORTED_EXTS = {".docx", ".pptx", ".xlsx", ".pdf", ".txt"}
+FILE_NAME_COLLECTION_SUFFIX = "__file_names"
+KIND_SCORE_WEIGHTS = {
+    "content": 1.0,
+    "file_name": 0.85,
+    "folder_name": 0.55,
+}
+_chroma_client_cache: Dict[str, chromadb.PersistentClient] = {}
+_collection_cache: Dict[Tuple[str, str], object] = {}
 
 
 # ---------- util ----------
@@ -36,6 +45,26 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
+def normalized_extension(path: str) -> str:
+    return Path(path).suffix.lower()
+
+
+def is_supported_file(path: str) -> bool:
+    return normalized_extension(path) in SUPPORTED_EXTS
+
+
+def should_index_file_name(path: str) -> bool:
+    return bool(Path(path).name) and not os.path.isdir(path)
+
+
+def should_index_folder_name(path: str) -> bool:
+    return os.path.isdir(path) and bool(Path(path).name)
+
+
+def should_index_name(path: str) -> bool:
+    return should_index_file_name(path) or should_index_folder_name(path)
+
+
 def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     text = normalize_whitespace(text)
     if not text:
@@ -52,12 +81,80 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 
-def iter_files(folder: str) -> Iterable[str]:
+def iter_name_indexable_paths(folder: str) -> Iterable[str]:
+    folder = os.path.abspath(folder)
     for root, _, files in os.walk(folder):
+        if should_index_folder_name(root) and os.path.abspath(root) != folder:
+            yield root
         for fn in files:
-            ext = os.path.splitext(fn)[1].lower()
-            if ext in SUPPORTED_EXTS:
-                yield os.path.join(root, fn)
+            path = os.path.join(root, fn)
+            if os.path.isfile(path) and should_index_file_name(path):
+                yield path
+
+
+def collect_indexable_paths(folder: str) -> List[str]:
+    return sorted(os.path.abspath(path) for path in iter_name_indexable_paths(folder))
+
+
+def filename_to_embedding_text(path: str) -> str:
+    file_name = os.path.basename(path)
+    stem = Path(file_name).stem
+    ext = Path(file_name).suffix.lower().lstrip(".")
+    normalized = re.sub(r"[_\-.]+", " ", stem)
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", normalized)
+    parts = [file_name, stem, normalized.strip()]
+    if ext:
+        parts.append(ext)
+    unique_parts = []
+    for part in parts:
+        part = normalize_whitespace(part)
+        if part and part not in unique_parts:
+            unique_parts.append(part)
+    return "\n".join(unique_parts)
+
+
+def path_signature(path: str) -> str:
+    if os.path.isdir(path):
+        return hashlib.sha256(f"folder|{Path(path).name}".encode("utf-8")).hexdigest()
+    if os.path.isfile(path) and is_supported_file(path):
+        return file_sha256(path)
+    return hashlib.sha256(f"file_name|{Path(path).name}".encode("utf-8")).hexdigest()
+
+
+def entry_type(path: str) -> str:
+    return "folder" if os.path.isdir(path) else "file"
+
+
+def manifest_entry_is_complete(entry: Dict | None) -> bool:
+    return bool(entry) and "entry_type" in entry and "content_indexed" in entry
+
+
+def manifest_entry_has_size(entry: Dict | None) -> bool:
+    return bool(entry) and "size" in entry
+
+
+def stat_size(path: str) -> int | None:
+    return os.path.getsize(path) if os.path.isfile(path) else None
+
+
+def resolve_path_signature(path: str, prev: Dict | None, *, content_supported: bool, mtime: float, size: int | None) -> Tuple[str, bool]:
+    if not prev:
+        sha = path_signature(path)
+        return sha, False
+
+    if content_supported:
+        if manifest_entry_has_size(prev) and prev.get("mtime") == mtime and prev.get("size") == size:
+            return prev["sha256"], True
+        sha = path_signature(path)
+        return sha, prev.get("sha256") == sha
+
+    sha = path_signature(path)
+    return sha, prev.get("sha256") == sha
+
+
+def weighted_similarity_score(kind: str, distance: float) -> float:
+    raw_score = 1.0 - float(distance)
+    return raw_score * KIND_SCORE_WEIGHTS.get(kind, 1.0)
 
 
 # ---------- extractors ----------
@@ -123,7 +220,7 @@ def extract_text_txt(path: str) -> str:
 
 
 def extract_text(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
+    ext = normalized_extension(path)
     if ext == ".docx":
         return extract_text_docx(path)
     if ext == ".pptx":
@@ -138,12 +235,31 @@ def extract_text(path: str) -> str:
 
 
 # ---------- chroma ----------
+def get_chroma_client(chroma_dir: str) -> chromadb.PersistentClient:
+    chroma_dir = os.path.abspath(chroma_dir)
+    client = _chroma_client_cache.get(chroma_dir)
+    if client is None:
+        client = chromadb.PersistentClient(
+            path=chroma_dir,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
+        _chroma_client_cache[chroma_dir] = client
+    return client
+
+
 def get_collection(chroma_dir: str, collection: str):
-    client = chromadb.PersistentClient(
-        path=chroma_dir,
-        settings=ChromaSettings(anonymized_telemetry=False),
-    )
-    return client.get_or_create_collection(name=collection)
+    chroma_dir = os.path.abspath(chroma_dir)
+    key = (chroma_dir, collection)
+    col = _collection_cache.get(key)
+    if col is None:
+        client = get_chroma_client(chroma_dir)
+        col = client.get_or_create_collection(name=collection)
+        _collection_cache[key] = col
+    return col
+
+
+def file_name_collection_name(collection: str) -> str:
+    return f"{collection}{FILE_NAME_COLLECTION_SUFFIX}"
 
 
 def delete_old_chunks_for_file(col, file_path: str) -> None:
@@ -152,6 +268,22 @@ def delete_old_chunks_for_file(col, file_path: str) -> None:
         col.delete(where={"file_path": file_path})
     except Exception:
         pass
+
+
+def delete_old_chunks_for_paths(cols: Iterable, file_paths: Iterable[str]) -> None:
+    for file_path in file_paths:
+        for col in cols:
+            delete_old_chunks_for_file(col, file_path)
+
+
+def prune_stale_files(manifest: Dict[str, Dict], active_files: Iterable[str]) -> List[str]:
+    active_set = set(active_files)
+    stale_paths = [file_path for file_path in manifest.keys() if file_path not in active_set]
+
+    for file_path in stale_paths:
+        manifest.pop(file_path, None)
+
+    return stale_paths
 
 
 # ---------- embedding / device ----------
@@ -212,104 +344,193 @@ def save_manifest(chroma_dir: str, manifest: Dict[str, Dict]) -> None:
 
 
 # ---------- main ops ----------
-def index_folder(settings: AppSettings) -> Tuple[int, int, int, str]:
+def index_folder(settings: AppSettings) -> Tuple[int, int, int, int, str]:
     docs_dir = os.path.abspath(settings.docs_dir)
     os.makedirs(settings.chroma_dir, exist_ok=True)
 
     col = get_collection(settings.chroma_dir, settings.collection)
+    file_name_col = get_collection(settings.chroma_dir, file_name_collection_name(settings.collection))
     device, note = resolve_device(settings.device)
-    model = get_embedder(settings.model_name, device)
+    model_name = load_embedding_model_name()
+    model: SentenceTransformer | None = None
 
     manifest = load_manifest(settings.chroma_dir)
+    current_paths = collect_indexable_paths(docs_dir)
+    stale_paths = prune_stale_files(manifest, current_paths)
+    delete_old_chunks_for_paths([col, file_name_col], stale_paths)
+    removed_files = len(stale_paths)
+    rebuild_file_name_index = file_name_col.count() != len(current_paths)
 
     to_add_ids: List[str] = []
     to_add_docs: List[str] = []
     to_add_metas: List[Dict] = []
     to_add_embs: List[List[float]] = []
+    to_add_file_name_ids: List[str] = []
+    to_add_file_name_docs: List[str] = []
+    to_add_file_name_metas: List[Dict] = []
+    to_add_file_name_embs: List[List[float]] = []
 
-    indexed_files = 0
-    skipped_files = 0
+    indexed_paths = 0
+    skipped_paths = 0
 
-    for path in iter_files(docs_dir):
-        abs_path = os.path.abspath(path)
+    for abs_path in current_paths:
         ext = os.path.splitext(abs_path)[1].lower()
         mtime = os.path.getmtime(abs_path)
+        size = stat_size(abs_path)
 
-        sha = file_sha256(abs_path)
         prev = manifest.get(abs_path)
-        if prev and prev.get("sha256") == sha:
-            skipped_files += 1
+        content_supported = os.path.isfile(abs_path) and is_supported_file(abs_path)
+        sha, file_is_current = resolve_path_signature(
+            abs_path,
+            prev,
+            content_supported=content_supported,
+            mtime=mtime,
+            size=size,
+        )
+        needs_manifest_refresh = (
+            not manifest_entry_is_complete(prev)
+            or (content_supported and not manifest_entry_has_size(prev))
+        )
+        if file_is_current and not rebuild_file_name_index and not needs_manifest_refresh:
+            skipped_paths += 1
             continue
 
-        delete_old_chunks_for_file(col, abs_path)
+        chunks: List[str] = []
+        if file_is_current:
+            delete_old_chunks_for_paths([file_name_col], [abs_path])
+        else:
+            delete_old_chunks_for_paths([col, file_name_col], [abs_path])
+            if content_supported:
+                text = extract_text(abs_path)
+                chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
 
-        text = extract_text(abs_path)
-        chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
-        if not chunks:
-            manifest[abs_path] = {"sha256": sha, "mtime": mtime, "ext": ext, "chunks": 0}
-            indexed_files += 1
-            continue
+        file_name_text = filename_to_embedding_text(abs_path)
+        texts_to_embed = [file_name_text, *chunks]
+
+        if model is None:
+            model = get_embedder(model_name, device)
 
         embs = model.encode(
-            chunks,
+            texts_to_embed,
             normalize_embeddings=True,
             batch_size=32,
             show_progress_bar=False,
         )
 
-        for i, (chunk, emb) in enumerate(zip(chunks, embs)):
-            # ★ID衝突回避：file_path + sha + i をhash化
-            cid = hashlib.sha256(f"{abs_path}|{sha}|{i}".encode("utf-8")).hexdigest()
-            to_add_ids.append(cid)
-            to_add_docs.append(chunk)
-            to_add_metas.append({
-                "file_path": abs_path,
-                "file_ext": ext,
-                "file_sha256": sha,
-                "chunk_index": i,
-                "mtime": mtime,
-            })
-            to_add_embs.append(emb.tolist())
+        file_name_emb = embs[0]
+        file_name_id = hashlib.sha256(f"{abs_path}|{sha}|file_name".encode("utf-8")).hexdigest()
+        to_add_file_name_ids.append(file_name_id)
+        to_add_file_name_docs.append(file_name_text)
+        to_add_file_name_metas.append({
+            "file_path": abs_path,
+            "file_ext": ext,
+            "file_sha256": sha,
+            "kind": "folder_name" if os.path.isdir(abs_path) else "file_name",
+            "entry_type": entry_type(abs_path),
+            "mtime": mtime,
+        })
+        to_add_file_name_embs.append(file_name_emb.tolist())
 
-        manifest[abs_path] = {"sha256": sha, "mtime": mtime, "ext": ext, "chunks": len(chunks)}
-        indexed_files += 1
+        if content_supported and not file_is_current:
+            for i, (chunk, emb) in enumerate(zip(chunks, embs[1:])):
+                # ★ID衝突回避：file_path + sha + i をhash化
+                cid = hashlib.sha256(f"{abs_path}|{sha}|{i}".encode("utf-8")).hexdigest()
+                to_add_ids.append(cid)
+                to_add_docs.append(chunk)
+                to_add_metas.append({
+                    "file_path": abs_path,
+                    "file_ext": ext,
+                    "file_sha256": sha,
+                    "chunk_index": i,
+                    "kind": "content",
+                    "entry_type": "file",
+                    "mtime": mtime,
+                })
+                to_add_embs.append(emb.tolist())
+
+        manifest[abs_path] = {
+            "sha256": sha,
+            "mtime": mtime,
+            "ext": ext,
+            "chunks": len(chunks),
+            "size": size,
+            "content_indexed": content_supported,
+            "entry_type": entry_type(abs_path),
+        }
+
+        indexed_paths += 1
 
     if to_add_ids:
         col.add(ids=to_add_ids, documents=to_add_docs, metadatas=to_add_metas, embeddings=to_add_embs)
+    if to_add_file_name_ids:
+        file_name_col.add(
+            ids=to_add_file_name_ids,
+            documents=to_add_file_name_docs,
+            metadatas=to_add_file_name_metas,
+            embeddings=to_add_file_name_embs,
+        )
 
     save_manifest(settings.chroma_dir, manifest)
-    return indexed_files, skipped_files, len(to_add_ids), note
+    return indexed_paths, skipped_paths, len(to_add_ids), removed_files, note
+
+
+def query_collection(col, q_emb: List[float], n_results: int) -> Tuple[List[str], List[Dict], List[float]]:
+    if n_results <= 0 or col.count() == 0:
+        return [], [], []
+
+    res = col.query(
+        query_embeddings=[q_emb],
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"],
+    )
+    return res["documents"][0], res["metadatas"][0], res["distances"][0]
+
+
+def merge_hits(
+    file_map: Dict[str, Dict],
+    docs: List[str],
+    metas: List[Dict],
+    dists: List[float],
+    *,
+    default_kind: str,
+) -> None:
+    for doc, meta, dist in zip(docs, metas, dists):
+        fp = meta["file_path"]
+        hit_kind = meta.get("kind", default_kind)
+        score = weighted_similarity_score(hit_kind, dist)
+        entry = file_map.setdefault(fp, {"best_score": score, "hits": []})
+        entry["best_score"] = max(entry["best_score"], score)
+        snippet = doc
+        if hit_kind == "content":
+            snippet = (doc[:260] + "…") if len(doc) > 260 else doc
+        entry["hits"].append({
+            "score": score,
+            "chunk_index": meta.get("chunk_index"),
+            "file_ext": meta.get("file_ext", ""),
+            "kind": hit_kind,
+            "entry_type": meta.get("entry_type", "file"),
+            "snippet": snippet,
+        })
 
 
 def search(settings: AppSettings, query: str) -> List[Tuple[str, float, List[Dict]]]:
     col = get_collection(settings.chroma_dir, settings.collection)
+    file_name_col = get_collection(settings.chroma_dir, file_name_collection_name(settings.collection))
     device, note = resolve_device(settings.device)
-    model = get_embedder(settings.model_name, device)
+    model_name = load_embedding_model_name()
+    model = get_embedder(model_name, device)
 
     q_emb = model.encode([query], normalize_embeddings=True)[0].tolist()
 
-    res = col.query(
-        query_embeddings=[q_emb],
-        n_results=settings.top_k_chunks,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
-
     file_map: Dict[str, Dict] = {}
-    for doc, meta, dist in zip(docs, metas, dists):
-        fp = meta["file_path"]
-        score = 1.0 - float(dist)  # cosine distance想定の簡易スコア
-        entry = file_map.setdefault(fp, {"best_score": score, "hits": []})
-        entry["best_score"] = max(entry["best_score"], score)
-        entry["hits"].append({
-            "score": score,
-            "chunk_index": meta["chunk_index"],
-            "file_ext": meta.get("file_ext", ""),
-            "snippet": (doc[:260] + "…") if len(doc) > 260 else doc,
-        })
+    docs, metas, dists = query_collection(col, q_emb, settings.top_k_chunks)
+    merge_hits(file_map, docs, metas, dists, default_kind="content")
+    file_name_docs, file_name_metas, file_name_dists = query_collection(
+        file_name_col,
+        q_emb,
+        max(settings.top_k_files * 3, settings.top_k_chunks),
+    )
+    merge_hits(file_map, file_name_docs, file_name_metas, file_name_dists, default_kind="file_name")
 
     ranked = sorted(file_map.items(), key=lambda kv: kv[1]["best_score"], reverse=True)[: settings.top_k_files]
     # note はUI側で表示したい場合、settings.deviceから resolve_device して出せます
