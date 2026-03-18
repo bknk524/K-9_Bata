@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 /data/chroma_store/
 /data/app_settings.json
+/data/embedding_model/
