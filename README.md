@@ -58,7 +58,7 @@ local-doc-search/
 1. プロジェクトを取得
 ZIPでダウンロードして展開するか、Git が使える場合は clone します。
 ```bash
-git clone <このリポジトリURL>
+git clone (https://github.com/bknk524/K-9_Bata.git)
 cd K-9_Bata
 ```
 
