@@ -13,7 +13,8 @@ ChromaDB + Sentence-Transformers（bge-m3）でローカル文書を索引化し
 - アプリ起動時に対象フォルダを自動でインデックス更新
 - 起動後も対象フォルダを監視し、追加・更新・削除されたファイルだけ自動反映
 - Windowsでフォルダ選択ダイアログ（Explorer）対応
-- CPU / GPU(CUDA) / NPU（UIで選択、未対応ならCPUへフォールバック）
+- CPU / GPU(CUDA) / NPU を UI で選択して埋め込み推論に使用
+- NPU は Torch NPU または ONNX Runtime の NPU provider を検出できた場合に使用し、使えない環境では CPU へフォールバック
 
 ---
 
@@ -33,6 +34,8 @@ ChromaDB + Sentence-Transformers（bge-m3）でローカル文書を索引化し
 - Python: 3.12.x
 - 仮想環境: venv
 - GPU: NVIDIA + CUDA（任意。TorchのCUDA版が必要）
+- NPU: 対応する Torch NPU もしくは ONNX Runtime provider が必要
+  - 例: `QNNExecutionProvider` / `OpenVINOExecutionProvider` / `DmlExecutionProvider`
 
 ---
 
@@ -49,7 +52,12 @@ local-doc-search/
 │  ├─ chroma_store/      # ChromaDB 永続保存領域
 │  ├─ embedding_model/   # ローカル埋め込みモデル配置先
 │  └─ app_settings.json  # 設定保存（初回起動後に生成）
-├─ requirements.txt      # 依存関係
+├─ requirements.txt      # 標準インストール（CPU）
+├─ requirements-core.txt
+├─ requirements-cpu.txt
+├─ requirements-gpu-cu128.txt
+├─ requirements-npu-directml.txt
+├─ requirements-npu-openvino.txt
 └─ README.md
 
 ```
@@ -81,9 +89,19 @@ venv\Scripts\activate
 ```
 
 6. 依存関係をインストール
+通常は CPU 版を入れます。
 ```bash
 pip install -r requirements.txt
 ```
+
+GPU / NPU を使う場合は、用途に応じて次を選びます。
+
+- CPU: `pip install -r requirements-cpu.txt`
+- GPU(CUDA 12.8): `pip install -r requirements-gpu-cu128.txt`
+- NPU(DirectML): `pip install -r requirements-npu-directml.txt`
+- NPU(OpenVINO): `pip install -r requirements-npu-openvino.txt`
+
+※ GPU は CUDA バージョンに合う PyTorch wheel が必要です。`requirements-gpu-cu128.txt` は CUDA 12.8 向けです。
 
 7. 検索対象ファイルを配置
 検索したい `docx / pptx / xlsx / pdf / txt` を `data/documents/` に入れます。
@@ -113,10 +131,13 @@ Remove-Item -Recurse -Force .\data\chroma_store
 ### 埋め込みモデルを手動で差し替える
 `data/embedding_model/` に SentenceTransformer / Hugging Face 形式のローカルモデルを配置してください。
 次回の索引化・検索からそのモデルを使います。
+NPU で使う場合は、同フォルダ配下に `onnx/model.onnx` があると ONNX Runtime 経由で利用できます。
 
 ## 補足
 - インデックスは `data/chroma_store` に保存されます
 - `data/embedding_model/` にローカルモデルを置くとそのフォルダを使います
 - `data/embedding_model/` が空の場合は `BAAI/bge-m3` をそのフォルダへ自動インストールします
+- `requirements.txt` は `requirements-cpu.txt` を読む標準入口です
+- GPU は `requirements-gpu-cu128.txt`、NPU は `requirements-npu-directml.txt` または `requirements-npu-openvino.txt` を使います
 - ワークスペースを別の絶対パスへ移動した場合でも、次回の「インデックス作成 / 更新」で古い索引を自動で掃除します
 

@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Callable, Iterable
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -39,6 +39,11 @@ class AutoIndexStatus:
     last_completed_at: float | None = None
     last_result: tuple[int, int, int, int, str] | None = None
     last_error: str | None = None
+    is_indexing: bool = False
+    progress_current: int = 0
+    progress_total: int = 0
+    progress_path: str | None = None
+    progress_stage: str | None = None
 
 
 class _DocsDirEventHandler(FileSystemEventHandler):
@@ -56,6 +61,7 @@ class AutoIndexManager:
         self._lock = threading.RLock()
         self._index_lock = threading.Lock()
         self._observer: Observer | None = None
+        self._worker_thread: threading.Thread | None = None
         self._watch_path: str | None = None
         self._settings = None
         self._timer: threading.Timer | None = None
@@ -95,14 +101,43 @@ class AutoIndexManager:
             timer.start()
             self._timer = timer
 
-    def run_now(self, settings: AppSettings, reason: str) -> tuple[int, int, int, int, str]:
+    def run_now(
+        self,
+        settings: AppSettings,
+        reason: str,
+        progress_callback: Callable[[int, int, str, str], None] | None = None,
+    ) -> tuple[int, int, int, int, str]:
         settings_copy = clone_settings(settings)
         with self._lock:
             self._settings = settings_copy
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
-        return self._run_index(settings_copy, reason)
+        return self._run_index(settings_copy, reason, progress_callback=progress_callback)
+
+    def start_background(self, settings: AppSettings, reason: str) -> bool:
+        settings_copy = clone_settings(settings)
+        with self._lock:
+            self._settings = settings_copy
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if self._worker_thread is not None and self._worker_thread.is_alive():
+                return False
+            self._status.last_error = None
+            self._status.is_indexing = True
+            self._status.progress_current = 0
+            self._status.progress_total = 0
+            self._status.progress_path = None
+            self._status.progress_stage = "読み込み中"
+            worker = threading.Thread(
+                target=self._run_background_index,
+                args=(settings_copy, reason),
+                daemon=True,
+            )
+            self._worker_thread = worker
+            worker.start()
+            return True
 
     def get_status(self) -> AutoIndexStatus:
         with self._lock:
@@ -112,6 +147,11 @@ class AutoIndexManager:
                 last_completed_at=self._status.last_completed_at,
                 last_result=self._status.last_result,
                 last_error=self._status.last_error,
+                is_indexing=self._status.is_indexing,
+                progress_current=self._status.progress_current,
+                progress_total=self._status.progress_total,
+                progress_path=self._status.progress_path,
+                progress_stage=self._status.progress_stage,
             )
 
     def _run_scheduled_reindex(self, reason: str) -> None:
@@ -122,15 +162,62 @@ class AutoIndexManager:
             return
         self._run_index(settings, reason)
 
-    def _run_index(self, settings, reason: str) -> tuple[int, int, int, int, str]:
+    def _run_background_index(self, settings, reason: str) -> None:
+        try:
+            self._run_index(settings, reason)
+        finally:
+            with self._lock:
+                if self._worker_thread is threading.current_thread():
+                    self._worker_thread = None
+
+    def _update_progress(
+        self,
+        current: int,
+        total: int,
+        path: str,
+        stage: str,
+        external_callback: Callable[[int, int, str, str], None] | None = None,
+    ) -> None:
+        with self._lock:
+            self._status.is_indexing = True
+            self._status.progress_current = current
+            self._status.progress_total = total
+            self._status.progress_path = path or None
+            self._status.progress_stage = stage
+        if external_callback is not None:
+            external_callback(current, total, path, stage)
+
+    def _run_index(
+        self,
+        settings,
+        reason: str,
+        progress_callback: Callable[[int, int, str, str], None] | None = None,
+    ) -> tuple[int, int, int, int, str]:
         with self._index_lock:
+            with self._lock:
+                self._status.is_indexing = True
+                self._status.progress_current = 0
+                self._status.progress_total = 0
+                self._status.progress_path = None
+                self._status.progress_stage = "準備中"
             try:
-                result = index_folder(settings)
+                result = index_folder(
+                    settings,
+                    progress_callback=lambda current, total, path, stage: self._update_progress(
+                        current,
+                        total,
+                        path,
+                        stage,
+                        external_callback=progress_callback,
+                    ),
+                )
             except Exception as exc:
                 with self._lock:
                     self._status.last_reason = reason
                     self._status.last_completed_at = time.time()
                     self._status.last_error = str(exc)
+                    self._status.is_indexing = False
+                    self._status.progress_stage = "失敗"
                 raise
 
             with self._lock:
@@ -138,6 +225,9 @@ class AutoIndexManager:
                 self._status.last_completed_at = time.time()
                 self._status.last_result = result
                 self._status.last_error = None
+                self._status.is_indexing = False
+                self._status.progress_current = self._status.progress_total
+                self._status.progress_stage = "完了"
 
             return result
 

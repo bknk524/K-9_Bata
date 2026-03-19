@@ -1,6 +1,10 @@
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
-from app.auto_index import should_trigger_reindex
+from app.auto_index import AutoIndexManager, should_trigger_reindex
+from app.settings import AppSettings
 
 
 class AutoIndexHelpersTest(unittest.TestCase):
@@ -28,6 +32,30 @@ class AutoIndexHelpersTest(unittest.TestCase):
         self.assertTrue(
             should_trigger_reindex("moved", False, ["E:/docs/tmp.bin", "E:/docs/notes.txt"])
         )
+
+    def test_start_background_sets_loading_status_and_avoids_duplicate_start(self):
+        manager = AutoIndexManager()
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run_index(self, settings, reason, progress_callback=None):
+            started.set()
+            release.wait(timeout=1.0)
+            with self._lock:
+                self._status.is_indexing = False
+            return (0, 0, 0, 0, "ok")
+
+        with patch.object(AutoIndexManager, "_run_index", autospec=True, side_effect=fake_run_index):
+            self.assertTrue(manager.start_background(AppSettings(), "startup"))
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertFalse(manager.start_background(AppSettings(), "startup"))
+
+            status = manager.get_status()
+            self.assertTrue(status.is_indexing)
+            self.assertEqual(status.progress_stage, "読み込み中")
+
+            release.set()
+            time.sleep(0.05)
 
 
 if __name__ == "__main__":

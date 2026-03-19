@@ -10,7 +10,10 @@ from app.core import (
     entry_type,
     file_name_collection_name,
     filename_to_embedding_text,
+    find_onnx_model_path,
+    query_collection,
     index_folder,
+    is_temporary_office_file,
     is_supported_file,
     manifest_entry_is_complete,
     manifest_entry_has_size,
@@ -18,7 +21,9 @@ from app.core import (
     normalized_extension,
     path_signature,
     prune_stale_files,
+    resolve_embedder_spec,
     resolve_path_signature,
+    select_npu_onnx_provider,
     should_index_file_name,
     should_index_folder_name,
     should_index_name,
@@ -38,7 +43,11 @@ class FakeCollection:
         self.deleted_paths = []
 
     def delete(self, where):
-        self.deleted_paths.append(where["file_path"])
+        file_path = where["file_path"]
+        if isinstance(file_path, dict) and "$in" in file_path:
+            self.deleted_paths.extend(file_path["$in"])
+            return
+        self.deleted_paths.append(file_path)
 
 
 class FakeChromaCollection:
@@ -72,6 +81,23 @@ class FakePersistentClient:
     def get_or_create_collection(self, name):
         FakePersistentClient.get_collection_calls += 1
         return {"name": name}
+
+
+class FakeQueryCollection:
+    def __init__(self, count_value: int) -> None:
+        self.count_value = count_value
+        self.requested_n_results = None
+
+    def count(self):
+        return self.count_value
+
+    def query(self, *, query_embeddings, n_results, include):
+        self.requested_n_results = n_results
+        return {
+            "documents": [["doc"] * n_results],
+            "metadatas": [[{"file_path": "E:/docs/report.txt"}] * n_results],
+            "distances": [[0.1] * n_results],
+        }
 
 
 class CoreHelpersTest(unittest.TestCase):
@@ -118,6 +144,31 @@ class CoreHelpersTest(unittest.TestCase):
         self.assertEqual(col1.deleted_paths, ["E:/docs/current.txt"])
         self.assertEqual(col2.deleted_paths, ["E:/docs/current.txt"])
 
+    def test_query_collection_caps_n_results_to_collection_count(self):
+        col = FakeQueryCollection(count_value=2)
+
+        docs, metas, dists = query_collection(col, [0.1, 0.2], 5)
+
+        self.assertEqual(col.requested_n_results, 2)
+        self.assertEqual(len(docs), 2)
+        self.assertEqual(len(metas), 2)
+        self.assertEqual(len(dists), 2)
+
+    def test_find_onnx_model_path_prefers_onnx_subfolder(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir) / "model"
+            onnx_dir = model_dir / "onnx"
+            onnx_dir.mkdir(parents=True)
+            model_path = onnx_dir / "model.onnx"
+            model_path.write_bytes(b"onnx")
+
+            self.assertEqual(find_onnx_model_path(str(model_dir)), model_path.resolve())
+
+    def test_select_npu_onnx_provider_uses_priority_order(self):
+        providers = ["CPUExecutionProvider", "DmlExecutionProvider", "OpenVINOExecutionProvider"]
+
+        self.assertEqual(select_npu_onnx_provider(providers), "OpenVINOExecutionProvider")
+
     def test_filename_to_embedding_text_contains_original_and_normalized_name(self):
         text = filename_to_embedding_text("E:/docs/K-9Project_team-C_v2.pptx")
 
@@ -134,9 +185,15 @@ class CoreHelpersTest(unittest.TestCase):
     def test_is_supported_file_uses_extension_allow_list(self):
         self.assertTrue(is_supported_file("E:/docs/REPORT.PDF"))
         self.assertFalse(is_supported_file("E:/docs/archive.zip"))
+        self.assertFalse(is_supported_file("E:/docs/~$REPORT.PDF"))
 
     def test_should_index_file_name_allows_unsupported_extensions(self):
         self.assertTrue(should_index_file_name("E:/docs/archive.zip"))
+        self.assertFalse(should_index_file_name("E:/docs/~$draft.pptx"))
+
+    def test_is_temporary_office_file_detects_lock_file(self):
+        self.assertTrue(is_temporary_office_file("E:/docs/~$draft.pptx"))
+        self.assertFalse(is_temporary_office_file("E:/docs/draft.pptx"))
 
     def test_should_index_folder_name_allows_named_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -223,6 +280,39 @@ class CoreHelpersTest(unittest.TestCase):
         core_module._chroma_client_cache.clear()
         core_module._collection_cache.clear()
 
+    def test_resolve_embedder_spec_uses_cuda_for_gpu_when_available(self):
+        with patch("app.core.detect_torch_cuda_available", return_value=True), \
+            patch("app.core.detect_torch_npu_device", return_value=None), \
+            patch("app.core.find_onnx_model_path", return_value=None):
+            spec = resolve_embedder_spec("cuda", "E:/models/bge")
+
+        self.assertEqual(spec.backend, "torch")
+        self.assertEqual(spec.resolved_device, "gpu")
+        self.assertEqual(spec.torch_device, "cuda")
+
+    def test_resolve_embedder_spec_uses_onnx_for_npu_when_provider_available(self):
+        onnx_path = Path("E:/models/bge/onnx/model.onnx")
+        with patch("app.core.detect_torch_cuda_available", return_value=False), \
+            patch("app.core.detect_torch_npu_device", return_value=None), \
+            patch("app.core.find_onnx_model_path", return_value=onnx_path), \
+            patch("app.core.get_available_onnx_providers", return_value=["CPUExecutionProvider", "QNNExecutionProvider"]):
+            spec = resolve_embedder_spec("npu", "E:/models/bge")
+
+        self.assertEqual(spec.backend, "onnx")
+        self.assertEqual(spec.resolved_device, "npu")
+        self.assertEqual(spec.onnx_provider, "QNNExecutionProvider")
+        self.assertEqual(spec.onnx_model_path, str(onnx_path))
+
+    def test_resolve_embedder_spec_falls_back_to_cpu_when_npu_unavailable(self):
+        with patch("app.core.detect_torch_cuda_available", return_value=False), \
+            patch("app.core.detect_torch_npu_device", return_value=None), \
+            patch("app.core.find_onnx_model_path", return_value=None):
+            spec = resolve_embedder_spec("npu", "E:/models/bge")
+
+        self.assertEqual(spec.backend, "torch")
+        self.assertEqual(spec.resolved_device, "cpu")
+        self.assertEqual(spec.torch_device, "cpu")
+
     def test_weighted_similarity_score_downweights_folder_name_hits(self):
         self.assertEqual(weighted_similarity_score("content", 0.0), 1.0)
         self.assertEqual(weighted_similarity_score("file_name", 0.0), 0.85)
@@ -307,6 +397,91 @@ class CoreHelpersTest(unittest.TestCase):
             self.assertNotIn(str(docs_dir.resolve()), saved_manifest)
             self.assertEqual(saved_manifest[str(nested_dir.resolve())]["entry_type"], "folder")
             self.assertFalse(saved_manifest[str(nested_dir.resolve())]["content_indexed"])
+
+    def test_index_folder_falls_back_to_name_only_when_text_extraction_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir) / "docs"
+            docs_dir.mkdir()
+            file_path = docs_dir / "broken.pptx"
+            file_path.write_bytes(b"not-a-real-pptx")
+
+            settings = AppSettings(
+                docs_dir=str(docs_dir),
+                chroma_dir=str(Path(tmpdir) / "chroma"),
+                collection="test_collection",
+            )
+            content_col = FakeChromaCollection()
+            name_col = FakeChromaCollection()
+            saved_manifest = {}
+
+            class FakeModel:
+                def encode(self, texts, **kwargs):
+                    return [FakeVector([float(i + 1)]) for i in range(len(texts))]
+
+            def fake_get_collection(chroma_dir, name):
+                if name == settings.collection:
+                    return content_col
+                if name == file_name_collection_name(settings.collection):
+                    return name_col
+                raise AssertionError(name)
+
+            def fake_save_manifest(chroma_dir, manifest):
+                saved_manifest.update(manifest)
+
+            with patch("app.core.get_collection", side_effect=fake_get_collection), \
+                patch("app.core.load_manifest", return_value={}), \
+                patch("app.core.save_manifest", side_effect=fake_save_manifest), \
+                patch("app.core.load_embedding_model_name", return_value="fake-model"), \
+                patch("app.core.resolve_embedder_spec", return_value=core_module.EmbedderSpec(backend="torch", resolved_device="cpu", torch_device="cpu", note="CPU")), \
+                patch("app.core.get_embedder", return_value=FakeModel()), \
+                patch("app.core.extract_text", side_effect=RuntimeError("broken")):
+                indexed, skipped, chunks, removed, note = index_folder(settings)
+
+            self.assertEqual(indexed, 1)
+            self.assertEqual(chunks, 0)
+            self.assertIn("抽出失敗 1 件", note)
+            self.assertEqual(len(name_col.add_calls), 1)
+            self.assertEqual(content_col.add_calls, [])
+            self.assertFalse(saved_manifest[str(file_path.resolve())]["content_indexed"])
+
+    def test_index_folder_reports_progress(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir) / "docs"
+            docs_dir.mkdir()
+            file_path = docs_dir / "note.txt"
+            file_path.write_text("hello world", encoding="utf-8")
+
+            settings = AppSettings(
+                docs_dir=str(docs_dir),
+                chroma_dir=str(Path(tmpdir) / "chroma"),
+                collection="test_collection",
+            )
+            content_col = FakeChromaCollection()
+            name_col = FakeChromaCollection()
+            progress_events = []
+
+            class FakeModel:
+                def encode(self, texts, **kwargs):
+                    return [FakeVector([float(i + 1)]) for i in range(len(texts))]
+
+            def fake_get_collection(chroma_dir, name):
+                if name == settings.collection:
+                    return content_col
+                if name == file_name_collection_name(settings.collection):
+                    return name_col
+                raise AssertionError(name)
+
+            with patch("app.core.get_collection", side_effect=fake_get_collection), \
+                patch("app.core.load_manifest", return_value={}), \
+                patch("app.core.save_manifest"), \
+                patch("app.core.load_embedding_model_name", return_value="fake-model"), \
+                patch("app.core.resolve_embedder_spec", return_value=core_module.EmbedderSpec(backend="torch", resolved_device="cpu", torch_device="cpu", note="CPU")), \
+                patch("app.core.get_embedder", return_value=FakeModel()):
+                index_folder(settings, progress_callback=lambda current, total, path, stage: progress_events.append((current, total, stage)))
+
+            self.assertTrue(progress_events)
+            self.assertEqual(progress_events[0][2], "準備中")
+            self.assertEqual(progress_events[-1][2], "完了")
 
     def test_load_embedding_model_name_returns_local_model_dir_when_model_exists(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,14 +1,18 @@
 from __future__ import annotations
+from dataclasses import dataclass
 import os
 import re
 import json
 import hashlib
 from pathlib import Path
-from typing import Iterable, List, Dict, Tuple
+from typing import Callable, Iterable, List, Dict, Tuple
 
 import chromadb
+import numpy as np
+import onnxruntime as ort
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
 
 from docx import Document as DocxDocument
 from pptx import Presentation
@@ -20,6 +24,12 @@ from app.settings import AppSettings
 
 SUPPORTED_EXTS = {".docx", ".pptx", ".xlsx", ".pdf", ".txt"}
 FILE_NAME_COLLECTION_SUFFIX = "__file_names"
+NPU_ONNX_PROVIDER_PRIORITY = (
+    "QNNExecutionProvider",
+    "OpenVINOExecutionProvider",
+    "DmlExecutionProvider",
+    "VitisAIExecutionProvider",
+)
 KIND_SCORE_WEIGHTS = {
     "content": 1.0,
     "file_name": 0.85,
@@ -27,6 +37,21 @@ KIND_SCORE_WEIGHTS = {
 }
 _chroma_client_cache: Dict[str, chromadb.PersistentClient] = {}
 _collection_cache: Dict[Tuple[str, str], object] = {}
+_embedder_cache: Dict[Tuple[str, ...], object] = {}
+
+
+@dataclass(frozen=True)
+class EmbedderSpec:
+    backend: str
+    resolved_device: str
+    note: str
+    torch_device: str | None = None
+    onnx_provider: str | None = None
+    onnx_model_path: str | None = None
+    tokenizer_path: str | None = None
+
+
+ProgressCallback = Callable[[int, int, str, str], None]
 
 
 # ---------- util ----------
@@ -49,12 +74,16 @@ def normalized_extension(path: str) -> str:
     return Path(path).suffix.lower()
 
 
+def is_temporary_office_file(path: str) -> bool:
+    return Path(path).name.startswith("~$")
+
+
 def is_supported_file(path: str) -> bool:
-    return normalized_extension(path) in SUPPORTED_EXTS
+    return not is_temporary_office_file(path) and normalized_extension(path) in SUPPORTED_EXTS
 
 
 def should_index_file_name(path: str) -> bool:
-    return bool(Path(path).name) and not os.path.isdir(path)
+    return bool(Path(path).name) and not os.path.isdir(path) and not is_temporary_office_file(path)
 
 
 def should_index_folder_name(path: str) -> bool:
@@ -155,6 +184,179 @@ def resolve_path_signature(path: str, prev: Dict | None, *, content_supported: b
 def weighted_similarity_score(kind: str, distance: float) -> float:
     raw_score = 1.0 - float(distance)
     return raw_score * KIND_SCORE_WEIGHTS.get(kind, 1.0)
+
+
+def get_available_onnx_providers() -> List[str]:
+    try:
+        return ort.get_available_providers()
+    except Exception:
+        return []
+
+
+def find_onnx_model_path(model_name: str) -> Path | None:
+    model_path = Path(model_name)
+    if not model_path.exists():
+        return None
+
+    candidates = [
+        model_path / "onnx" / "model.onnx",
+        model_path / "model.onnx",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def find_onnx_tokenizer_path(model_name: str, onnx_model_path: Path) -> Path:
+    onnx_dir = onnx_model_path.parent
+    if (onnx_dir / "tokenizer.json").exists() or (onnx_dir / "tokenizer_config.json").exists():
+        return onnx_dir
+    return Path(model_name)
+
+
+def select_npu_onnx_provider(available_providers: Iterable[str]) -> str | None:
+    available = set(available_providers)
+    for provider in NPU_ONNX_PROVIDER_PRIORITY:
+        if provider in available:
+            return provider
+    return None
+
+
+def detect_torch_cuda_available() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def detect_torch_npu_device() -> str | None:
+    try:
+        import torch
+
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return "npu"
+    except Exception:
+        return None
+    return None
+
+
+def resolve_embedder_spec(device_setting: str, model_name: str) -> EmbedderSpec:
+    device_setting = (device_setting or "auto").lower()
+    if device_setting == "gpu":
+        device_setting = "cuda"
+
+    cuda_ok = detect_torch_cuda_available()
+    torch_npu_device = detect_torch_npu_device()
+    onnx_model_path = find_onnx_model_path(model_name)
+    onnx_provider = select_npu_onnx_provider(get_available_onnx_providers()) if onnx_model_path else None
+
+    if device_setting == "cpu":
+        return EmbedderSpec(backend="torch", resolved_device="cpu", torch_device="cpu", note="CPU指定")
+
+    if device_setting == "cuda":
+        if cuda_ok:
+            return EmbedderSpec(backend="torch", resolved_device="gpu", torch_device="cuda", note="GPU(CUDA)指定")
+        return EmbedderSpec(
+            backend="torch",
+            resolved_device="cpu",
+            torch_device="cpu",
+            note="GPU(CUDA)指定でしたが利用不可のためCPUへフォールバック",
+        )
+
+    if device_setting == "npu":
+        if torch_npu_device:
+            return EmbedderSpec(
+                backend="torch",
+                resolved_device="npu",
+                torch_device=torch_npu_device,
+                note="NPU指定（Torchバックエンド）",
+            )
+        if onnx_provider and onnx_model_path is not None:
+            tokenizer_path = find_onnx_tokenizer_path(model_name, onnx_model_path)
+            return EmbedderSpec(
+                backend="onnx",
+                resolved_device="npu",
+                onnx_provider=onnx_provider,
+                onnx_model_path=str(onnx_model_path),
+                tokenizer_path=str(tokenizer_path),
+                note=f"NPU指定（ONNX Runtime: {onnx_provider}）",
+            )
+        return EmbedderSpec(
+            backend="torch",
+            resolved_device="cpu",
+            torch_device="cpu",
+            note="NPU指定でしたが利用可能なTorch NPU/ONNX providerが無いためCPUへフォールバック",
+        )
+
+    if cuda_ok:
+        return EmbedderSpec(backend="torch", resolved_device="gpu", torch_device="cuda", note="AUTO判定: GPU(CUDA)")
+    if torch_npu_device:
+        return EmbedderSpec(
+            backend="torch",
+            resolved_device="npu",
+            torch_device=torch_npu_device,
+            note="AUTO判定: NPU(Torch)",
+        )
+    if onnx_provider and onnx_model_path is not None:
+        tokenizer_path = find_onnx_tokenizer_path(model_name, onnx_model_path)
+        return EmbedderSpec(
+            backend="onnx",
+            resolved_device="npu",
+            onnx_provider=onnx_provider,
+            onnx_model_path=str(onnx_model_path),
+            tokenizer_path=str(tokenizer_path),
+            note=f"AUTO判定: NPU(ONNX Runtime {onnx_provider})",
+        )
+    return EmbedderSpec(backend="torch", resolved_device="cpu", torch_device="cpu", note="AUTO判定: CPU")
+
+
+class OnnxRuntimeEmbedder:
+    def __init__(self, model_path: str, tokenizer_path: str, provider: str) -> None:
+        self.model_path = model_path
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        self.session = ort.InferenceSession(
+            model_path,
+            providers=[provider, "CPUExecutionProvider"],
+        )
+        self.input_names = {item.name for item in self.session.get_inputs()}
+        self.output_names = [item.name for item in self.session.get_outputs()]
+
+    def encode(
+        self,
+        texts,
+        normalize_embeddings: bool = True,
+        batch_size: int = 32,
+        show_progress_bar: bool = False,
+    ):
+        if isinstance(texts, str):
+            texts = [texts]
+        vectors: List[np.ndarray] = []
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+            tokens = self.tokenizer(batch, padding=True, truncation=True, return_tensors="np")
+            feeds = {
+                name: np.asarray(value, dtype=np.int64)
+                for name, value in tokens.items()
+                if name in self.input_names
+            }
+            outputs = self.session.run(None, feeds)
+            output_map = dict(zip(self.output_names, outputs))
+            embeddings = output_map.get("sentence_embedding")
+            if embeddings is None:
+                token_embeddings = output_map["token_embeddings"]
+                embeddings = token_embeddings[:, 0, :]
+            embeddings = np.asarray(embeddings, dtype=np.float32)
+            if normalize_embeddings:
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                embeddings = embeddings / np.clip(norms, 1e-12, None)
+            vectors.append(embeddings)
+
+        if not vectors:
+            return np.empty((0, 0), dtype=np.float32)
+        return np.vstack(vectors)
 
 
 # ---------- extractors ----------
@@ -271,8 +473,18 @@ def delete_old_chunks_for_file(col, file_path: str) -> None:
 
 
 def delete_old_chunks_for_paths(cols: Iterable, file_paths: Iterable[str]) -> None:
-    for file_path in file_paths:
-        for col in cols:
+    unique_paths = list(dict.fromkeys(file_paths))
+    if not unique_paths:
+        return
+
+    for col in cols:
+        try:
+            col.delete(where={"file_path": {"$in": unique_paths}})
+            continue
+        except Exception:
+            pass
+
+        for file_path in unique_paths:
             delete_old_chunks_for_file(col, file_path)
 
 
@@ -287,41 +499,36 @@ def prune_stale_files(manifest: Dict[str, Dict], active_files: Iterable[str]) ->
 
 
 # ---------- embedding / device ----------
-def resolve_device(device_setting: str) -> Tuple[str, str]:
-    """
-    returns: (device_for_sentence_transformers, note)
-    - cpu / cuda は torch の世界
-    - npu は環境差が大きいので、現状は「対応バックエンドが無ければcpuへ」。
-    """
-    device_setting = (device_setting or "auto").lower()
-
-    try:
-        import torch
-        cuda_ok = torch.cuda.is_available()
-    except Exception:
-        cuda_ok = False
-
-    if device_setting == "cpu":
-        return "cpu", "CPU指定"
-    if device_setting == "cuda":
-        if cuda_ok:
-            return "cuda", "CUDA(GPU)指定"
-        return "cpu", "CUDA指定でしたが利用不可のためCPUへフォールバック"
-    if device_setting == "npu":
-        # ここは“拡張ポイント”
-        # 将来: ONNXRuntime(OpenVINO/DirectML)等の埋め込みバックエンドを実装したら切替可能
-        return "cpu", "NPU指定（現構成では未対応のためCPUへフォールバック）"
-    # auto
-    return ("cuda" if cuda_ok else "cpu"), "AUTO判定"
+def resolve_device(device_setting: str, model_name: str | None = None) -> Tuple[str, str]:
+    model_name = model_name or load_embedding_model_name()
+    spec = resolve_embedder_spec(device_setting, model_name)
+    return spec.resolved_device, spec.note
 
 
-_embedder_cache: Dict[Tuple[str, str], SentenceTransformer] = {}
+def get_device_option_statuses(model_name: str | None = None) -> Dict[str, bool]:
+    model_name = model_name or load_embedding_model_name()
+    return {
+        "auto": True,
+        "cpu": True,
+        "cuda": resolve_embedder_spec("cuda", model_name).resolved_device == "gpu",
+        "npu": resolve_embedder_spec("npu", model_name).resolved_device == "npu",
+    }
 
 
-def get_embedder(model_name: str, device: str) -> SentenceTransformer:
-    key = (model_name, device)
+def get_embedder(model_name: str, spec: EmbedderSpec):
+    if spec.backend == "onnx":
+        key = ("onnx", spec.onnx_model_path or "", spec.onnx_provider or "")
+        if key not in _embedder_cache:
+            _embedder_cache[key] = OnnxRuntimeEmbedder(
+                model_path=spec.onnx_model_path or "",
+                tokenizer_path=spec.tokenizer_path or model_name,
+                provider=spec.onnx_provider or "CPUExecutionProvider",
+            )
+        return _embedder_cache[key]
+
+    key = ("torch", model_name, spec.torch_device or "cpu")
     if key not in _embedder_cache:
-        _embedder_cache[key] = SentenceTransformer(model_name, device=device)
+        _embedder_cache[key] = SentenceTransformer(model_name, device=spec.torch_device)
     return _embedder_cache[key]
 
 
@@ -344,15 +551,19 @@ def save_manifest(chroma_dir: str, manifest: Dict[str, Dict]) -> None:
 
 
 # ---------- main ops ----------
-def index_folder(settings: AppSettings) -> Tuple[int, int, int, int, str]:
+def index_folder(
+    settings: AppSettings,
+    progress_callback: ProgressCallback | None = None,
+) -> Tuple[int, int, int, int, str]:
     docs_dir = os.path.abspath(settings.docs_dir)
     os.makedirs(settings.chroma_dir, exist_ok=True)
 
     col = get_collection(settings.chroma_dir, settings.collection)
     file_name_col = get_collection(settings.chroma_dir, file_name_collection_name(settings.collection))
-    device, note = resolve_device(settings.device)
     model_name = load_embedding_model_name()
-    model: SentenceTransformer | None = None
+    spec = resolve_embedder_spec(settings.device, model_name)
+    note = spec.note
+    model = None
 
     manifest = load_manifest(settings.chroma_dir)
     current_paths = collect_indexable_paths(docs_dir)
@@ -372,8 +583,13 @@ def index_folder(settings: AppSettings) -> Tuple[int, int, int, int, str]:
 
     indexed_paths = 0
     skipped_paths = 0
+    extraction_error_paths: List[str] = []
+    total_paths = len(current_paths)
 
-    for abs_path in current_paths:
+    if progress_callback is not None:
+        progress_callback(0, total_paths, "", "準備中")
+
+    for index, abs_path in enumerate(current_paths, start=1):
         ext = os.path.splitext(abs_path)[1].lower()
         mtime = os.path.getmtime(abs_path)
         size = stat_size(abs_path)
@@ -393,6 +609,8 @@ def index_folder(settings: AppSettings) -> Tuple[int, int, int, int, str]:
         )
         if file_is_current and not rebuild_file_name_index and not needs_manifest_refresh:
             skipped_paths += 1
+            if progress_callback is not None:
+                progress_callback(index, total_paths, abs_path, "スキップ")
             continue
 
         chunks: List[str] = []
@@ -401,15 +619,24 @@ def index_folder(settings: AppSettings) -> Tuple[int, int, int, int, str]:
         else:
             delete_old_chunks_for_paths([col, file_name_col], [abs_path])
             if content_supported:
-                text = extract_text(abs_path)
-                chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
+                try:
+                    if progress_callback is not None:
+                        progress_callback(index, total_paths, abs_path, "本文抽出")
+                    text = extract_text(abs_path)
+                    chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
+                except Exception:
+                    content_supported = False
+                    chunks = []
+                    extraction_error_paths.append(abs_path)
 
         file_name_text = filename_to_embedding_text(abs_path)
         texts_to_embed = [file_name_text, *chunks]
 
         if model is None:
-            model = get_embedder(model_name, device)
+            model = get_embedder(model_name, spec)
 
+        if progress_callback is not None:
+            progress_callback(index, total_paths, abs_path, "埋め込み")
         embs = model.encode(
             texts_to_embed,
             normalize_embeddings=True,
@@ -459,6 +686,8 @@ def index_folder(settings: AppSettings) -> Tuple[int, int, int, int, str]:
         }
 
         indexed_paths += 1
+        if progress_callback is not None:
+            progress_callback(index, total_paths, abs_path, "完了")
 
     if to_add_ids:
         col.add(ids=to_add_ids, documents=to_add_docs, metadatas=to_add_metas, embeddings=to_add_embs)
@@ -471,12 +700,18 @@ def index_folder(settings: AppSettings) -> Tuple[int, int, int, int, str]:
         )
 
     save_manifest(settings.chroma_dir, manifest)
+    if extraction_error_paths:
+        note = f"{note} / 抽出失敗 {len(extraction_error_paths)} 件は名前のみ索引化"
+    if progress_callback is not None:
+        progress_callback(total_paths, total_paths, "", "完了")
     return indexed_paths, skipped_paths, len(to_add_ids), removed_files, note
 
 
 def query_collection(col, q_emb: List[float], n_results: int) -> Tuple[List[str], List[Dict], List[float]]:
-    if n_results <= 0 or col.count() == 0:
+    available = col.count()
+    if n_results <= 0 or available == 0:
         return [], [], []
+    n_results = min(n_results, available)
 
     res = col.query(
         query_embeddings=[q_emb],
@@ -516,9 +751,9 @@ def merge_hits(
 def search(settings: AppSettings, query: str) -> List[Tuple[str, float, List[Dict]]]:
     col = get_collection(settings.chroma_dir, settings.collection)
     file_name_col = get_collection(settings.chroma_dir, file_name_collection_name(settings.collection))
-    device, note = resolve_device(settings.device)
     model_name = load_embedding_model_name()
-    model = get_embedder(model_name, device)
+    spec = resolve_embedder_spec(settings.device, model_name)
+    model = get_embedder(model_name, spec)
 
     q_emb = model.encode([query], normalize_embeddings=True)[0].tolist()
 

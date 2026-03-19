@@ -16,7 +16,7 @@ from tkinter import filedialog
 from app.auto_index import AutoIndexManager
 from app.embedding_model import DEFAULT_EMBEDDING_MODEL_DIR, load_embedding_model_name
 from app.settings import AppSettings
-from app.core import search, resolve_device
+from app.core import get_device_option_statuses, search, resolve_device
 
 
 def pick_directory(title: str, initial_dir: str = "") -> str:
@@ -256,6 +256,12 @@ def inject_styles() -> None:
             line-height: 1.7;
             font-size: 0.94rem;
         }
+        .device-option-hint {
+            margin-top: 0.45rem;
+            color: rgba(191, 208, 227, 0.58);
+            font-size: 0.84rem;
+            line-height: 1.6;
+        }
         .empty-state {
             background: rgba(15, 23, 42, 0.8);
             border: 1px dashed rgba(100, 116, 139, 0.7);
@@ -263,6 +269,47 @@ def inject_styles() -> None:
             padding: 1.4rem 1.2rem;
             color: #bfd0e3;
             line-height: 1.7;
+        }
+        .loading-panel {
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            border-radius: 18px;
+            padding: 1rem 1.1rem;
+            margin: 0.55rem 0 0.8rem;
+        }
+        .loading-title {
+            color: #eff6ff;
+            font-size: 0.98rem;
+            font-weight: 700;
+            margin-bottom: 0.7rem;
+        }
+        .loading-stats {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+        .loading-stat {
+            background: rgba(30, 41, 59, 0.76);
+            border: 1px solid rgba(71, 85, 105, 0.45);
+            border-radius: 14px;
+            padding: 0.7rem 0.8rem;
+        }
+        .loading-stat-label {
+            color: #94a3b8;
+            font-size: 0.78rem;
+            margin-bottom: 0.18rem;
+        }
+        .loading-stat-value {
+            color: #f8fafc;
+            font-size: 1.15rem;
+            font-weight: 700;
+        }
+        .loading-detail {
+            color: #bfd0e3;
+            font-size: 0.9rem;
+            line-height: 1.6;
+            margin-top: 0.65rem;
         }
         </style>
         """
@@ -283,6 +330,64 @@ def format_result_summary(result: tuple[int, int, int, int, str] | None) -> str:
         f"索引化 {indexed} 件 / スキップ {skipped} 件 / "
         f"追加チャンク {chunks} 件 / 削除 {removed} 件（{note}）"
     )
+
+
+def format_progress_text(current: int, total: int, path: str | None, stage: str | None) -> str:
+    if total <= 0:
+        return stage or "準備中"
+    file_name = os.path.basename(path) if path else ""
+    base = f"{current}/{total} 件"
+    if stage:
+        base = f"{base} | {stage}"
+    if file_name:
+        base = f"{base} | {file_name}"
+    return base
+
+
+def progress_ratio(current: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return min(max(current / total, 0.0), 1.0)
+
+
+def progress_percent(current: int, total: int) -> int:
+    return int(round(progress_ratio(current, total) * 100))
+
+
+def render_progress_panel(
+    title: str,
+    current: int,
+    total: int,
+    path: str | None,
+    stage: str | None,
+) -> None:
+    percent = progress_percent(current, total)
+    file_name = os.path.basename(path) if path else "-"
+    detail = format_progress_text(current, total, path, stage)
+    st.markdown(
+        f"""
+        <div class="loading-panel">
+            <div class="loading-title">{html.escape(title)}</div>
+            <div class="loading-stats">
+                <div class="loading-stat">
+                    <div class="loading-stat-label">進捗率</div>
+                    <div class="loading-stat-value">{percent}%</div>
+                </div>
+                <div class="loading-stat">
+                    <div class="loading-stat-label">処理済み</div>
+                    <div class="loading-stat-value">{current} / {total if total > 0 else '-'}</div>
+                </div>
+                <div class="loading-stat">
+                    <div class="loading-stat-label">現在の対象</div>
+                    <div class="loading-stat-value">{html.escape(file_name)}</div>
+                </div>
+            </div>
+            <div class="loading-detail">{html.escape(detail)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.progress(progress_ratio(current, total), text=f"{percent}% | {detail}")
 
 
 def open_file(path: str) -> None:
@@ -332,10 +437,8 @@ settings = AppSettings.load()
 
 if "settings" not in st.session_state:
     st.session_state["settings"] = settings
-if "startup_index_done" not in st.session_state:
-    st.session_state["startup_index_done"] = False
-if "startup_index_error" not in st.session_state:
-    st.session_state["startup_index_error"] = None
+if "startup_index_requested" not in st.session_state:
+    st.session_state["startup_index_requested"] = False
 if "ui_action_message" not in st.session_state:
     st.session_state["ui_action_message"] = None
 if "ui_action_error" not in st.session_state:
@@ -357,21 +460,19 @@ def get_auto_index_manager() -> AutoIndexManager:
     return AutoIndexManager()
 
 
-def run_startup_index(manager: AutoIndexManager) -> None:
-    if st.session_state["startup_index_done"]:
+@st.cache_resource
+def get_current_embedding_model_path() -> str:
+    return load_embedding_model_name()
+
+
+def ensure_startup_index(manager: AutoIndexManager) -> None:
+    if st.session_state["startup_index_requested"]:
         return
-    try:
-        with st.spinner("起動時に文書を確認しています…"):
-            manager.run_now(s(), "startup")
-        st.session_state["startup_index_error"] = None
-    except Exception as exc:
-        st.session_state["startup_index_error"] = str(exc)
-    finally:
-        st.session_state["startup_index_done"] = True
+    manager.start_background(s(), "startup")
+    st.session_state["startup_index_requested"] = True
 
 
 auto_index_manager = get_auto_index_manager()
-run_startup_index(auto_index_manager)
 
 with st.sidebar:
     st.markdown("## 利用設定")
@@ -431,12 +532,32 @@ with st.sidebar:
             value=int(s().chunk_overlap),
             step=20,
         )
+        current_model = get_current_embedding_model_path()
+        device_statuses = get_device_option_statuses(current_model)
+        device_labels = {
+            "auto": "自動",
+            "cpu": "CPU",
+            "cuda": "GPU (CUDA)" + (" (非対応)" if not device_statuses["cuda"] else ""),
+            "npu": "NPU" + (" (非対応)" if not device_statuses["npu"] else ""),
+        }
         s().device = st.selectbox(
-            "実行デバイス",
+            "推論デバイス",
             ["auto", "cpu", "cuda", "npu"],
             index=["auto", "cpu", "cuda", "npu"].index(s().device if s().device else "auto"),
+            format_func=lambda value: device_labels[value],
         )
-        current_model = load_embedding_model_name()
+        unavailable_labels = []
+        if not device_statuses["cuda"]:
+            unavailable_labels.append("GPU (CUDA) はこの環境では非対応")
+        if not device_statuses["npu"]:
+            unavailable_labels.append("NPU はこの環境では非対応")
+        if unavailable_labels:
+            st.markdown(
+                "<div class='device-option-hint'>"
+                + "<br>".join(html.escape(label) for label in unavailable_labels)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
         st.text_input("埋め込みモデルフォルダ", value=str(DEFAULT_EMBEDDING_MODEL_DIR), disabled=True)
         st.caption(f"現在の埋め込みモデル: `{current_model}`")
 
@@ -447,10 +568,39 @@ with st.sidebar:
 inject_styles()
 
 auto_index_manager.configure(s())
+ensure_startup_index(auto_index_manager)
 auto_index_status = auto_index_manager.get_status()
-device_resolved, device_note = resolve_device(s().device)
+current_model = get_current_embedding_model_path()
+device_resolved, device_note = resolve_device(s().device, current_model)
 docs_dir_exists = os.path.isdir(os.path.abspath(s().docs_dir))
 watch_state = "監視中" if auto_index_status.watching_path and docs_dir_exists else "対象フォルダ未確認"
+
+
+@st.experimental_fragment(run_every=1)
+def render_loading_state() -> None:
+    status = auto_index_manager.get_status()
+    if not status.is_indexing:
+        return
+    st.info("文書を読み込み中です。検索画面は先に表示しています。")
+    render_progress_panel(
+        "起動時の読み込み状況",
+        status.progress_current,
+        status.progress_total,
+        status.progress_path,
+        status.progress_stage,
+    )
+
+
+def render_live_progress(status) -> None:
+    if not status.is_indexing and status.progress_total <= 0:
+        return
+    render_progress_panel(
+        "ベクトル化の進捗",
+        status.progress_current,
+        status.progress_total,
+        status.progress_path,
+        status.progress_stage,
+    )
 
 st.markdown(
     """
@@ -465,6 +615,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+render_loading_state()
 
 flow_cols = st.columns(3, gap="large")
 flow_items = [
@@ -494,7 +646,11 @@ status_cols[3].metric("実行デバイス", device_resolved)
 status_left, status_right = st.columns([2.2, 1], gap="large")
 with status_left:
     st.markdown("### 現在の状態")
-    status_message = format_result_summary(auto_index_status.last_result)
+    status_message = (
+        "起動時に文書を読み込み中です。完了後に最新状態が反映されます。"
+        if auto_index_status.is_indexing and auto_index_status.last_result is None
+        else format_result_summary(auto_index_status.last_result)
+    )
     last_reason = auto_index_status.last_reason or "-"
     st.markdown(
         f"""
@@ -508,22 +664,37 @@ with status_left:
         """,
         unsafe_allow_html=True,
     )
+    if auto_index_status.is_indexing or auto_index_status.progress_total > 0:
+        render_live_progress(auto_index_status)
     if not docs_dir_exists:
         st.warning("検索対象フォルダが見つかりません。設定からフォルダを確認してください。")
-    if st.session_state["startup_index_error"]:
-        st.error(f"起動時の自動更新に失敗しました: {st.session_state['startup_index_error']}")
     if auto_index_status.last_error:
         st.error(f"自動更新でエラーが発生しました: {auto_index_status.last_error}")
 
 with status_right:
     st.markdown("### 操作")
-    manual_update = st.button("今すぐ更新", type="primary", use_container_width=True)
+    manual_update = st.button(
+        "今すぐ更新",
+        type="primary",
+        use_container_width=True,
+        disabled=auto_index_status.is_indexing,
+    )
     refresh_status = st.button("画面を再表示", use_container_width=True)
     if refresh_status:
         st.rerun()
     if manual_update:
-        with st.spinner("変更分を更新しています…"):
-            indexed, skipped, chunks, removed, note = auto_index_manager.run_now(s(), "manual")
+        progress_box = st.empty()
+
+        def update_progress(current: int, total: int, path: str, stage: str) -> None:
+            with progress_box.container():
+                render_progress_panel("手動更新の進捗", current, total, path, stage)
+
+        indexed, skipped, chunks, removed, note = auto_index_manager.run_now(
+            s(),
+            "manual",
+            progress_callback=update_progress,
+        )
+        progress_box.empty()
         st.success(
             f"更新完了：索引化 {indexed} 件 / スキップ {skipped} 件 / "
             f"追加チャンク {chunks} 件 / 削除 {removed} 件（{note}）"
