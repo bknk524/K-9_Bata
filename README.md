@@ -52,12 +52,11 @@ local-doc-search/
 │  ├─ chroma_store/      # ChromaDB 永続保存領域
 │  ├─ embedding_model/   # ローカル埋め込みモデル配置先
 │  └─ app_settings.json  # 設定保存（初回起動後に生成）
-├─ requirements.txt      # 標準インストール（CPU）
-├─ requirements-core.txt
-├─ requirements-cpu.txt
-├─ requirements-gpu-cu128.txt
-├─ requirements-npu-directml.txt
-├─ requirements-npu-openvino.txt
+├─ requirements.txt      # 標準インストール入口
+├─ requirements/
+│  ├─ requirements-gpu-cu128.txt
+│  ├─ requirements-npu-directml.txt
+│  └─ requirements-npu-openvino.txt
 └─ README.md
 
 ```
@@ -89,36 +88,43 @@ venv\Scripts\activate
 ```
 
 6. 依存関係をインストール
-通常は CPU 版を入れます。
+`pip` の更新と依存導入は 1 回のコマンドにまとめられます。通常は CPU 版を入れます。
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip -r requirements.txt
 ```
 
 GPU / NPU を使う場合は、用途に応じて次を選びます。
 
-- CPU: `pip install -r requirements-cpu.txt`
-- GPU(CUDA 12.8): `pip install -r requirements-gpu-cu128.txt`
-- NPU(DirectML): `pip install -r requirements-npu-directml.txt`
-- NPU(OpenVINO): `pip install -r requirements-npu-openvino.txt`
+- CPU: `python -m pip install --upgrade pip -r requirements.txt`
+- GPU(CUDA 12.8): `python -m pip install --upgrade pip -r requirements/requirements-gpu-cu128.txt`
+- NPU(DirectML): `python -m pip install --upgrade pip -r requirements/requirements-npu-directml.txt`
+- NPU(OpenVINO): `python -m pip install --upgrade pip -r requirements/requirements-npu-openvino.txt`
 
-※ GPU は CUDA バージョンに合う PyTorch wheel が必要です。`requirements-gpu-cu128.txt` は CUDA 12.8 向けです。
+※ GPU は CUDA バージョンに合う PyTorch wheel が必要です。`requirements/requirements-gpu-cu128.txt` は CUDA 12.8 向けで、`torch==2.9.1+cu128` を優先的に入れる設定です。
+※ CPU 環境から GPU / NPU 環境へ切り替えるときは、既存 venv を使い回すより新しい venv を作る方が安全です。
 
-7. 検索対象ファイルを配置
+7. GPU 利用可否を確認（GPU を使う場合）
+```bash
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no gpu')"
+```
+`torch.cuda.is_available()` が `True` になれば、UI で `GPU (CUDA)` を選べます。
+
+8. 検索対象ファイルを配置
 検索したい `docx / pptx / xlsx / pdf / txt` を `data/documents/` に入れます。
 
-8. アプリを起動
+9. アプリを起動
 ```bash
 streamlit run .\app\ui_app.py
 ```
 
-9. 起動時の自動インデックス更新を待つ
+10. 起動時の自動インデックス更新を待つ
 ブラウザで開いた UI の起動直後に、設定されている対象フォルダを自動でインデックス更新します。
 `data/embedding_model/` が空の場合は、このタイミングで `BAAI/bge-m3` を自動ダウンロードしてから索引化します。
 
-10. 起動後の自動監視
+11. 起動後の自動監視
 アプリ起動中は対象フォルダを監視し、ファイルの追加・更新・削除を検知すると変更があった分だけ自動で再反映します。
 
-11. 必要に応じて手動で再インデックス
+12. 必要に応じて手動で再インデックス
 設定を変更した後や、対象フォルダの内容をすぐ反映したい場合は UI の「インデックス作成 / 更新」を押します。
 
 ## 補助操作
@@ -137,7 +143,9 @@ NPU で使う場合は、同フォルダ配下に `onnx/model.onnx` があると
 - インデックスは `data/chroma_store` に保存されます
 - `data/embedding_model/` にローカルモデルを置くとそのフォルダを使います
 - `data/embedding_model/` が空の場合は `BAAI/bge-m3` をそのフォルダへ自動インストールします
-- `requirements.txt` は `requirements-cpu.txt` を読む標準入口です
-- GPU は `requirements-gpu-cu128.txt`、NPU は `requirements-npu-directml.txt` または `requirements-npu-openvino.txt` を使います
+- `requirements.txt` は CPU 向けの標準依存です
+- GPU は `requirements/requirements-gpu-cu128.txt`、NPU は `requirements/requirements-npu-directml.txt` または `requirements/requirements-npu-openvino.txt` を使います
+- `requirements/` フォルダに環境別の依存ファイルをまとめています
+- GPU 用 `requirements/requirements-gpu-cu128.txt` は CUDA wheel を優先するため、CPU 版 `torch` が混ざりにくいように `--index-url` を調整しています
 - ワークスペースを別の絶対パスへ移動した場合でも、次回の「インデックス作成 / 更新」で古い索引を自動で掃除します
 

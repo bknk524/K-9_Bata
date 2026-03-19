@@ -455,6 +455,12 @@ def s() -> AppSettings:
     return st.session_state["settings"]
 
 
+def clear_search_state() -> None:
+    st.session_state["search_query"] = ""
+    st.session_state["search_results"] = None
+    st.session_state["last_search_query"] = ""
+
+
 @st.cache_resource
 def get_auto_index_manager() -> AutoIndexManager:
     return AutoIndexManager()
@@ -718,19 +724,17 @@ with st.form("search_form", clear_on_submit=False):
     )
     action_cols = st.columns([1, 1, 2], gap="small")
     search_submitted = action_cols[0].form_submit_button("検索する", type="primary", use_container_width=True)
-    clear_submitted = action_cols[1].form_submit_button("入力をクリア", use_container_width=True)
+    action_cols[1].form_submit_button(
+        "入力をクリア",
+        use_container_width=True,
+        on_click=clear_search_state,
+    )
     action_cols[2].markdown(
         "<div style='padding-top: 0.85rem; color: #64748b; font-size: 0.92rem;'>"
         "ファイル名の正式名称でも、本文中の言い回しでも探せます。"
         "</div>",
         unsafe_allow_html=True,
     )
-
-if clear_submitted:
-    st.session_state["search_query"] = ""
-    st.session_state["search_results"] = None
-    st.session_state["last_search_query"] = ""
-    st.rerun()
 
 if search_submitted:
     query = st.session_state["search_query"].strip()
