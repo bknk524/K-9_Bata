@@ -88,7 +88,7 @@ venv\Scripts\activate
 ```
 
 6. 依存関係をインストール
-`pip` の更新と依存導入は 1 回のコマンドにまとめられます。通常は CPU 版を入れます。
+`pip` の更新と依存導入はCPU 版を入れます。
 ```bash
 python -m pip install --upgrade pip -r requirements.txt
 ```
