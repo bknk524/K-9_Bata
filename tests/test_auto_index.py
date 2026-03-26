@@ -45,7 +45,8 @@ class AutoIndexHelpersTest(unittest.TestCase):
                 self._status.is_indexing = False
             return (0, 0, 0, 0, "ok")
 
-        with patch.object(AutoIndexManager, "_run_index", autospec=True, side_effect=fake_run_index):
+        with patch("app.auto_index.needs_index_update", return_value=True), \
+            patch.object(AutoIndexManager, "_run_index", autospec=True, side_effect=fake_run_index):
             self.assertTrue(manager.start_background(AppSettings(), "startup"))
             self.assertTrue(started.wait(timeout=1.0))
             self.assertFalse(manager.start_background(AppSettings(), "startup"))
@@ -56,6 +57,18 @@ class AutoIndexHelpersTest(unittest.TestCase):
 
             release.set()
             time.sleep(0.05)
+
+    def test_start_background_skips_startup_when_no_changes(self):
+        manager = AutoIndexManager()
+
+        with patch("app.auto_index.needs_index_update", return_value=False):
+            started = manager.start_background(AppSettings(), "startup")
+
+        self.assertFalse(started)
+        status = manager.get_status()
+        self.assertFalse(status.is_indexing)
+        self.assertEqual(status.last_reason, "startup")
+        self.assertEqual(status.last_result, (0, 0, 0, 0, "起動時スキップ: 変更なし"))
 
 
 if __name__ == "__main__":

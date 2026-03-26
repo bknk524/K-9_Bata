@@ -1,4 +1,5 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import os
 import re
@@ -22,6 +23,7 @@ from pypdf import PdfReader
 from app.embedding_model import load_embedding_model_name
 from app.settings import AppSettings
 
+# このファイルは、文書抽出・索引化・検索・埋め込みデバイス選択をまとめて扱う中核ロジック。
 SUPPORTED_EXTS = {".docx", ".pptx", ".xlsx", ".pdf", ".txt"}
 FILE_NAME_COLLECTION_SUFFIX = "__file_names"
 NPU_ONNX_PROVIDER_PRIORITY = (
@@ -54,7 +56,7 @@ class EmbedderSpec:
 ProgressCallback = Callable[[int, int, str, str], None]
 
 
-# ---------- util ----------
+# パス判定、チャンク分割、差分判定などの共通処理。
 def file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -359,7 +361,7 @@ class OnnxRuntimeEmbedder:
         return np.vstack(vectors)
 
 
-# ---------- extractors ----------
+# Office / PDF / txt から本文を抜き出す抽出処理。
 def extract_text_docx(path: str) -> str:
     doc = DocxDocument(path)
     parts: List[str] = []
@@ -436,7 +438,7 @@ def extract_text(path: str) -> str:
     return ""
 
 
-# ---------- chroma ----------
+# ChromaDB の client / collection を再利用しながら扱う処理。
 def get_chroma_client(chroma_dir: str) -> chromadb.PersistentClient:
     chroma_dir = os.path.abspath(chroma_dir)
     client = _chroma_client_cache.get(chroma_dir)
@@ -498,7 +500,7 @@ def prune_stale_files(manifest: Dict[str, Dict], active_files: Iterable[str]) ->
     return stale_paths
 
 
-# ---------- embedding / device ----------
+# CPU / GPU / NPU の判定と、埋め込みモデルの読み出し処理。
 def resolve_device(device_setting: str, model_name: str | None = None) -> Tuple[str, str]:
     model_name = model_name or load_embedding_model_name()
     spec = resolve_embedder_spec(device_setting, model_name)
@@ -532,7 +534,7 @@ def get_embedder(model_name: str, spec: EmbedderSpec):
     return _embedder_cache[key]
 
 
-# ---------- manifest ----------
+# 前回索引との差分を見るための manifest 読み書き。
 def manifest_path(chroma_dir: str) -> Path:
     return Path(chroma_dir) / "manifest.json"
 
@@ -550,7 +552,43 @@ def save_manifest(chroma_dir: str, manifest: Dict[str, Dict]) -> None:
     p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ---------- main ops ----------
+def needs_index_update(settings: AppSettings) -> bool:
+    docs_dir = os.path.abspath(settings.docs_dir)
+    manifest = load_manifest(settings.chroma_dir)
+    current_paths = collect_indexable_paths(docs_dir)
+
+    if set(manifest.keys()) != set(current_paths):
+        return True
+
+    try:
+        file_name_col = get_collection(settings.chroma_dir, file_name_collection_name(settings.collection))
+        if file_name_col.count() != len(current_paths):
+            return True
+    except Exception:
+        return True
+
+    for abs_path in current_paths:
+        prev = manifest.get(abs_path)
+        if not manifest_entry_is_complete(prev):
+            return True
+        if entry_type(abs_path) != prev.get("entry_type"):
+            return True
+
+        content_supported = os.path.isfile(abs_path) and is_supported_file(abs_path)
+        if content_supported:
+            if not manifest_entry_has_size(prev):
+                return True
+            if prev.get("mtime") != os.path.getmtime(abs_path):
+                return True
+            if prev.get("size") != stat_size(abs_path):
+                return True
+        elif prev.get("content_indexed"):
+            return True
+
+    return False
+
+
+# 実際の索引化本体。差分判定、本文抽出、埋め込み、DB 更新までをまとめて行う。
 def index_folder(
     settings: AppSettings,
     progress_callback: ProgressCallback | None = None,
@@ -585,6 +623,8 @@ def index_folder(
     skipped_paths = 0
     extraction_error_paths: List[str] = []
     total_paths = len(current_paths)
+    pending_entries: List[Dict] = []
+    paths_for_parallel_extract: List[str] = []
 
     if progress_callback is not None:
         progress_callback(0, total_paths, "", "準備中")
@@ -613,21 +653,95 @@ def index_folder(
                 progress_callback(index, total_paths, abs_path, "スキップ")
             continue
 
-        chunks: List[str] = []
         if file_is_current:
             delete_old_chunks_for_paths([file_name_col], [abs_path])
         else:
             delete_old_chunks_for_paths([col, file_name_col], [abs_path])
             if content_supported:
-                try:
+                paths_for_parallel_extract.append(abs_path)
+
+        pending_entries.append({
+            "position": index,
+            "path": abs_path,
+            "ext": ext,
+            "mtime": mtime,
+            "size": size,
+            "sha": sha,
+            "file_is_current": file_is_current,
+            "content_supported": content_supported,
+        })
+
+    extracted_chunks_by_path: Dict[str, List[str]] = {}
+    if paths_for_parallel_extract:
+        if len(paths_for_parallel_extract) == 1:
+            extract_path = paths_for_parallel_extract[0]
+            try:
+                if progress_callback is not None:
+                    target_position = next(
+                        entry["position"] for entry in pending_entries
+                        if entry["path"] == extract_path
+                    )
+                    progress_callback(target_position, total_paths, extract_path, "本文抽出")
+                extracted_chunks_by_path[extract_path] = chunk_text(
+                    extract_text(extract_path),
+                    settings.chunk_size,
+                    settings.chunk_overlap,
+                )
+            except Exception:
+                extracted_chunks_by_path[extract_path] = []
+                extraction_error_paths = [extract_path]
+        else:
+            progress_position_by_path = {
+                entry["path"]: entry["position"]
+                for entry in pending_entries
+                if entry["path"] in paths_for_parallel_extract
+            }
+
+            max_workers = min(len(paths_for_parallel_extract), max(2, min(4, os.cpu_count() or 1)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_path = {
+                    executor.submit(extract_text, path): path
+                    for path in paths_for_parallel_extract
+                }
+                completed_extracts = 0
+                for future in as_completed(future_to_path):
+                    abs_path = future_to_path[future]
+                    completed_extracts += 1
+                    try:
+                        extracted_chunks_by_path[abs_path] = chunk_text(
+                            future.result(),
+                            settings.chunk_size,
+                            settings.chunk_overlap,
+                        )
+                    except Exception:
+                        extracted_chunks_by_path[abs_path] = []
+                        extraction_error_paths.append(abs_path)
+
                     if progress_callback is not None:
-                        progress_callback(index, total_paths, abs_path, "本文抽出")
-                    text = extract_text(abs_path)
-                    chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
-                except Exception:
-                    content_supported = False
-                    chunks = []
-                    extraction_error_paths.append(abs_path)
+                        progress_callback(
+                            progress_position_by_path.get(abs_path, completed_extracts),
+                            total_paths,
+                            abs_path,
+                            f"本文抽出 {completed_extracts}/{len(paths_for_parallel_extract)}",
+                        )
+
+    extraction_error_set = set(extraction_error_paths)
+
+    for entry in pending_entries:
+        abs_path = entry["path"]
+        ext = entry["ext"]
+        mtime = entry["mtime"]
+        size = entry["size"]
+        sha = entry["sha"]
+        file_is_current = entry["file_is_current"]
+        content_supported = entry["content_supported"]
+        chunks: List[str] = []
+
+        if content_supported and not file_is_current:
+            if abs_path in extraction_error_set:
+                content_supported = False
+            else:
+                chunks = extracted_chunks_by_path.get(abs_path, [])
 
         file_name_text = filename_to_embedding_text(abs_path)
         texts_to_embed = [file_name_text, *chunks]
@@ -636,7 +750,7 @@ def index_folder(
             model = get_embedder(model_name, spec)
 
         if progress_callback is not None:
-            progress_callback(index, total_paths, abs_path, "埋め込み")
+            progress_callback(entry["position"], total_paths, abs_path, "埋め込み")
         embs = model.encode(
             texts_to_embed,
             normalize_embeddings=True,
@@ -687,7 +801,7 @@ def index_folder(
 
         indexed_paths += 1
         if progress_callback is not None:
-            progress_callback(index, total_paths, abs_path, "完了")
+            progress_callback(entry["position"], total_paths, abs_path, "完了")
 
     if to_add_ids:
         col.add(ids=to_add_ids, documents=to_add_docs, metadatas=to_add_metas, embeddings=to_add_embs)
@@ -749,6 +863,7 @@ def merge_hits(
 
 
 def search(settings: AppSettings, query: str) -> List[Tuple[str, float, List[Dict]]]:
+    # 本文検索と名前検索の結果をまとめて、ファイル単位で返す。
     col = get_collection(settings.chroma_dir, settings.collection)
     file_name_col = get_collection(settings.chroma_dir, file_name_collection_name(settings.collection))
     model_name = load_embedding_model_name()

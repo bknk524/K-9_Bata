@@ -11,6 +11,7 @@ from app.core import (
     file_name_collection_name,
     filename_to_embedding_text,
     find_onnx_model_path,
+    needs_index_update,
     query_collection,
     index_folder,
     is_temporary_office_file,
@@ -263,6 +264,63 @@ class CoreHelpersTest(unittest.TestCase):
 
             self.assertEqual(sha, "cached-sha")
             self.assertTrue(is_current)
+
+    def test_needs_index_update_returns_false_when_manifest_matches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir) / "docs"
+            docs_dir.mkdir()
+            file_path = docs_dir / "report.txt"
+            file_path.write_text("hello", encoding="utf-8")
+
+            settings = AppSettings(
+                docs_dir=str(docs_dir),
+                chroma_dir=str(Path(tmpdir) / "chroma"),
+                collection="test_collection",
+            )
+            manifest = {
+                str(file_path.resolve()): {
+                    "sha256": path_signature(str(file_path)),
+                    "mtime": file_path.stat().st_mtime,
+                    "ext": ".txt",
+                    "chunks": 1,
+                    "size": file_path.stat().st_size,
+                    "content_indexed": True,
+                    "entry_type": "file",
+                }
+            }
+
+            with patch("app.core.load_manifest", return_value=manifest), \
+                patch("app.core.get_collection", return_value=FakeChromaCollection(count_value=1)):
+                self.assertFalse(needs_index_update(settings))
+
+    def test_needs_index_update_returns_true_when_supported_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir) / "docs"
+            docs_dir.mkdir()
+            file_path = docs_dir / "report.txt"
+            file_path.write_text("hello", encoding="utf-8")
+
+            settings = AppSettings(
+                docs_dir=str(docs_dir),
+                chroma_dir=str(Path(tmpdir) / "chroma"),
+                collection="test_collection",
+            )
+            manifest = {
+                str(file_path.resolve()): {
+                    "sha256": path_signature(str(file_path)),
+                    "mtime": file_path.stat().st_mtime,
+                    "ext": ".txt",
+                    "chunks": 1,
+                    "size": file_path.stat().st_size,
+                    "content_indexed": True,
+                    "entry_type": "file",
+                }
+            }
+            file_path.write_text("hello world", encoding="utf-8")
+
+            with patch("app.core.load_manifest", return_value=manifest), \
+                patch("app.core.get_collection", return_value=FakeChromaCollection(count_value=1)):
+                self.assertTrue(needs_index_update(settings))
 
     def test_get_collection_reuses_cached_client_and_collection(self):
         core_module._chroma_client_cache.clear()

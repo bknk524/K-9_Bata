@@ -52,7 +52,7 @@ local-doc-search/
 │  ├─ chroma_store/      # ChromaDB 永続保存領域
 │  ├─ embedding_model/   # ローカル埋め込みモデル配置先
 │  └─ app_settings.json  # 設定保存（初回起動後に生成）
-├─ requirements.txt      # 標準インストール入口
+├─ requirements.txt      # CPU 向けの標準依存
 ├─ requirements/
 │  ├─ requirements-gpu-cu128.txt
 │  ├─ requirements-npu-directml.txt
@@ -88,7 +88,7 @@ venv\Scripts\activate
 ```
 
 6. 依存関係をインストール
-`pip` の更新と依存導入はCPU 版を入れます。
+通常は CPU 版を入れます。
 ```bash
 python -m pip install --upgrade pip -r requirements.txt
 ```
@@ -126,8 +126,6 @@ streamlit run .\app\ui_app.py
 
 12. 必要に応じて手動で再インデックス
 設定を変更した後や、対象フォルダの内容をすぐ反映したい場合は UI の「インデックス作成 / 更新」を押します。
-
-## 補助操作
 
 ### DB初期化
 ```bash

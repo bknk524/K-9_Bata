@@ -1,0 +1,43 @@
+OSS Licenses Summary
+
+This file summarizes the main open-source software used by this app.
+It is based on the current requirements files and the package metadata
+available in the current local environment.
+
+Primary packages
+
+- streamlit: Apache License 2.0
+- chromadb: Apache License 2.0
+- watchdog: Apache License 2.0
+- huggingface-hub: Apache License 2.0
+- sentence-transformers: Apache License 2.0
+- transformers: Apache License 2.0
+- torch: BSD-3-Clause
+- numpy: BSD-style license
+- onnxruntime: MIT License
+- python-docx: MIT
+- python-pptx: MIT
+- openpyxl: MIT
+- pypdf: BSD-style license
+
+Embedding model
+
+- BAAI/bge-m3: MIT
+  Reference in local model card:
+  data/embedding_model/README.md
+
+Optional packages used only for some environments
+
+- onnxruntime-directml: optional dependency for NPU/DirectML environments
+- onnxruntime-openvino: optional dependency for NPU/OpenVINO environments
+- openvino: optional dependency for NPU/OpenVINO environments
+
+Notes
+
+- requirements.txt is the standard CPU dependency set.
+- requirements/requirements-gpu-cu128.txt is for NVIDIA GPU environments.
+- requirements/requirements-npu-directml.txt is for DirectML environments.
+- requirements/requirements-npu-openvino.txt is for OpenVINO environments.
+- This is a practical summary, not a full transitive dependency report.
+- For redistribution or formal compliance review, generate a complete
+  dependency license inventory separately.
