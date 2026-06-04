@@ -11,6 +11,7 @@ from app.core import (
     file_name_collection_name,
     filename_to_embedding_text,
     find_onnx_model_path,
+    needs_index_update,
     query_collection,
     index_folder,
     is_temporary_office_file,
@@ -264,6 +265,63 @@ class CoreHelpersTest(unittest.TestCase):
             self.assertEqual(sha, "cached-sha")
             self.assertTrue(is_current)
 
+    def test_needs_index_update_returns_false_when_manifest_matches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir) / "docs"
+            docs_dir.mkdir()
+            file_path = docs_dir / "report.txt"
+            file_path.write_text("hello", encoding="utf-8")
+
+            settings = AppSettings(
+                docs_dir=str(docs_dir),
+                chroma_dir=str(Path(tmpdir) / "chroma"),
+                collection="test_collection",
+            )
+            manifest = {
+                str(file_path.resolve()): {
+                    "sha256": path_signature(str(file_path)),
+                    "mtime": file_path.stat().st_mtime,
+                    "ext": ".txt",
+                    "chunks": 1,
+                    "size": file_path.stat().st_size,
+                    "content_indexed": True,
+                    "entry_type": "file",
+                }
+            }
+
+            with patch("app.core.load_manifest", return_value=manifest), \
+                patch("app.core.get_collection", return_value=FakeChromaCollection(count_value=1)):
+                self.assertFalse(needs_index_update(settings))
+
+    def test_needs_index_update_returns_true_when_supported_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir) / "docs"
+            docs_dir.mkdir()
+            file_path = docs_dir / "report.txt"
+            file_path.write_text("hello", encoding="utf-8")
+
+            settings = AppSettings(
+                docs_dir=str(docs_dir),
+                chroma_dir=str(Path(tmpdir) / "chroma"),
+                collection="test_collection",
+            )
+            manifest = {
+                str(file_path.resolve()): {
+                    "sha256": path_signature(str(file_path)),
+                    "mtime": file_path.stat().st_mtime,
+                    "ext": ".txt",
+                    "chunks": 1,
+                    "size": file_path.stat().st_size,
+                    "content_indexed": True,
+                    "entry_type": "file",
+                }
+            }
+            file_path.write_text("hello world", encoding="utf-8")
+
+            with patch("app.core.load_manifest", return_value=manifest), \
+                patch("app.core.get_collection", return_value=FakeChromaCollection(count_value=1)):
+                self.assertTrue(needs_index_update(settings))
+
     def test_get_collection_reuses_cached_client_and_collection(self):
         core_module._chroma_client_cache.clear()
         core_module._collection_cache.clear()
@@ -282,6 +340,7 @@ class CoreHelpersTest(unittest.TestCase):
 
     def test_resolve_embedder_spec_uses_cuda_for_gpu_when_available(self):
         with patch("app.core.detect_torch_cuda_available", return_value=True), \
+            patch("app.core.detect_torch_xpu_available", return_value=False), \
             patch("app.core.detect_torch_npu_device", return_value=None), \
             patch("app.core.find_onnx_model_path", return_value=None):
             spec = resolve_embedder_spec("cuda", "E:/models/bge")
@@ -290,9 +349,21 @@ class CoreHelpersTest(unittest.TestCase):
         self.assertEqual(spec.resolved_device, "gpu")
         self.assertEqual(spec.torch_device, "cuda")
 
+    def test_resolve_embedder_spec_uses_xpu_for_intel_gpu_when_available(self):
+        with patch("app.core.detect_torch_cuda_available", return_value=False), \
+            patch("app.core.detect_torch_xpu_available", return_value=True), \
+            patch("app.core.detect_torch_npu_device", return_value=None), \
+            patch("app.core.find_onnx_model_path", return_value=None):
+            spec = resolve_embedder_spec("xpu", "E:/models/bge")
+
+        self.assertEqual(spec.backend, "torch")
+        self.assertEqual(spec.resolved_device, "gpu")
+        self.assertEqual(spec.torch_device, "xpu")
+
     def test_resolve_embedder_spec_uses_onnx_for_npu_when_provider_available(self):
         onnx_path = Path("E:/models/bge/onnx/model.onnx")
         with patch("app.core.detect_torch_cuda_available", return_value=False), \
+            patch("app.core.detect_torch_xpu_available", return_value=False), \
             patch("app.core.detect_torch_npu_device", return_value=None), \
             patch("app.core.find_onnx_model_path", return_value=onnx_path), \
             patch("app.core.get_available_onnx_providers", return_value=["CPUExecutionProvider", "QNNExecutionProvider"]):
@@ -305,6 +376,7 @@ class CoreHelpersTest(unittest.TestCase):
 
     def test_resolve_embedder_spec_falls_back_to_cpu_when_npu_unavailable(self):
         with patch("app.core.detect_torch_cuda_available", return_value=False), \
+            patch("app.core.detect_torch_xpu_available", return_value=False), \
             patch("app.core.detect_torch_npu_device", return_value=None), \
             patch("app.core.find_onnx_model_path", return_value=None):
             spec = resolve_embedder_spec("npu", "E:/models/bge")

@@ -4,3 +4,4 @@ __pycache__/
 /data/chroma_store/
 /data/app_settings.json
 /data/embedding_model/
+/data/documents/

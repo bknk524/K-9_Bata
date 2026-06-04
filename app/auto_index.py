@@ -10,9 +10,10 @@ from typing import Callable, Iterable
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from app.core import index_folder, should_index_name
+from app.core import index_folder, needs_index_update, should_index_name
 from app.settings import AppSettings
 
+# このファイルは、起動時の自動索引とフォルダ監視による再索引を管理する。
 AUTO_INDEX_DEBOUNCE_SECONDS = 1.0
 
 
@@ -47,6 +48,7 @@ class AutoIndexStatus:
 
 
 class _DocsDirEventHandler(FileSystemEventHandler):
+    # watchdog のイベントを受けて、再索引が必要な変更だけを manager に渡す。
     def __init__(self, manager: "AutoIndexManager") -> None:
         self.manager = manager
 
@@ -57,6 +59,7 @@ class _DocsDirEventHandler(FileSystemEventHandler):
 
 
 class AutoIndexManager:
+    # UI とは別スレッドで索引を動かし、監視状態と進捗も保持する。
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._index_lock = threading.Lock()
@@ -123,6 +126,17 @@ class AutoIndexManager:
                 self._timer.cancel()
                 self._timer = None
             if self._worker_thread is not None and self._worker_thread.is_alive():
+                return False
+            if reason == "startup" and not needs_index_update(settings_copy):
+                self._status.last_reason = reason
+                self._status.last_completed_at = time.time()
+                self._status.last_result = (0, 0, 0, 0, "起動時スキップ: 変更なし")
+                self._status.last_error = None
+                self._status.is_indexing = False
+                self._status.progress_current = 0
+                self._status.progress_total = 0
+                self._status.progress_path = None
+                self._status.progress_stage = None
                 return False
             self._status.last_error = None
             self._status.is_indexing = True

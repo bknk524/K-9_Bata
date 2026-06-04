@@ -1,0 +1,17 @@
+--index-url https://download.pytorch.org/whl/xpu
+--extra-index-url https://pypi.org/simple
+
+chromadb==0.5.5
+streamlit==1.36.0
+watchdog==4.0.2
+huggingface-hub==0.36.0
+numpy==1.26.4
+python-docx==1.1.2
+python-pptx==0.6.23
+openpyxl==3.1.5
+pypdf==4.3.1
+torch==2.9.1
+sentence-transformers==3.0.1
+scikit-learn==1.5.2
+transformers==4.57.3
+onnxruntime==1.23.2

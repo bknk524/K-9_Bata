@@ -10,8 +10,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import streamlit as st
-import tkinter as tk
-from tkinter import filedialog
 
 from app.auto_index import AutoIndexManager
 from app.embedding_model import DEFAULT_EMBEDDING_MODEL_DIR, load_embedding_model_name
@@ -19,22 +17,46 @@ from app.settings import AppSettings
 from app.core import get_device_option_statuses, search, resolve_device
 
 
+# ローカル実行向けの Streamlit UI 本体。設定、進捗表示、検索画面をまとめている。
 def pick_directory(title: str, initial_dir: str = "") -> str:
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    try:
-        selected = filedialog.askdirectory(
-            title=title,
-            initialdir=initial_dir if initial_dir else None,
-            mustexist=True,
-        )
-    finally:
-        root.destroy()
-    return selected or ""
+    if os.name != "nt":
+        raise RuntimeError("この環境ではフォルダ参照ダイアログを利用できません。")
+
+    initial_path = os.path.abspath(initial_dir) if initial_dir else ""
+    if initial_path and not os.path.isdir(initial_path):
+        initial_path = ""
+
+    ps_title = title.replace("'", "''")
+    ps_initial_path = initial_path.replace("'", "''")
+    script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '{ps_title}'
+$dialog.ShowNewFolderButton = $false
+if ('{ps_initial_path}') {{
+    $dialog.SelectedPath = '{ps_initial_path}'
+}}
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {{
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $dialog.SelectedPath
+}}
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("フォルダ選択ダイアログを開けませんでした。パス欄へ直接入力してください。")
+    return completed.stdout.strip()
 
 
 def inject_styles() -> None:
+    # 業務向けの見た目になるように全体 CSS をまとめて差し込む。
     css = """
         <style>
         .stApp {
@@ -401,6 +423,7 @@ def reveal_file_in_explorer(path: str) -> None:
 
 
 def render_hit(hit: dict) -> None:
+    # 1 件のヒットを「本文一致 / 名前一致」が分かるカードで表示する。
     if hit["kind"] == "folder_name":
         source_label = "フォルダ名で一致"
         badge_class = "name"
@@ -435,10 +458,13 @@ st.set_page_config(
 
 settings = AppSettings.load()
 
+# Streamlit の rerun をまたいで保持したい状態をここで初期化する。
 if "settings" not in st.session_state:
     st.session_state["settings"] = settings
 if "startup_index_requested" not in st.session_state:
     st.session_state["startup_index_requested"] = False
+if "startup_index_docs_dir" not in st.session_state:
+    st.session_state["startup_index_docs_dir"] = None
 if "ui_action_message" not in st.session_state:
     st.session_state["ui_action_message"] = None
 if "ui_action_error" not in st.session_state:
@@ -472,6 +498,10 @@ def get_current_embedding_model_path() -> str:
 
 
 def ensure_startup_index(manager: AutoIndexManager) -> None:
+    docs_dir = os.path.abspath(s().docs_dir)
+    if st.session_state["startup_index_docs_dir"] != docs_dir:
+        st.session_state["startup_index_requested"] = False
+        st.session_state["startup_index_docs_dir"] = docs_dir
     if st.session_state["startup_index_requested"]:
         return
     manager.start_background(s(), "startup")
@@ -480,6 +510,7 @@ def ensure_startup_index(manager: AutoIndexManager) -> None:
 
 auto_index_manager = get_auto_index_manager()
 
+# サイドバーは、検索対象フォルダや件数などの運用設定をまとめた領域。
 with st.sidebar:
     st.markdown("## 利用設定")
     st.caption("通常は対象フォルダを確認すれば、そのまま使い始められます。")
@@ -490,7 +521,12 @@ with st.sidebar:
         s().docs_dir = st.text_input("検索対象フォルダ", value=s().docs_dir)
     with c2:
         if st.button("参照", key="pick_docs", use_container_width=True):
-            picked = pick_directory("検索対象フォルダを選択", s().docs_dir)
+            try:
+                picked = pick_directory("検索対象フォルダを選択", s().docs_dir)
+            except Exception as exc:
+                st.session_state["ui_action_error"] = str(exc)
+                st.session_state["ui_action_message"] = None
+                st.rerun()
             if picked:
                 s().docs_dir = os.path.abspath(picked)
                 st.rerun()
@@ -513,7 +549,12 @@ with st.sidebar:
         s().chroma_dir = st.text_input("インデックス保存先", value=s().chroma_dir)
     with d2:
         if st.button("参照", key="pick_chroma", use_container_width=True):
-            picked = pick_directory("インデックス保存先を選択", s().chroma_dir)
+            try:
+                picked = pick_directory("インデックス保存先を選択", s().chroma_dir)
+            except Exception as exc:
+                st.session_state["ui_action_error"] = str(exc)
+                st.session_state["ui_action_message"] = None
+                st.rerun()
             if picked:
                 s().chroma_dir = os.path.abspath(picked)
                 st.rerun()
@@ -544,17 +585,26 @@ with st.sidebar:
             "auto": "自動",
             "cpu": "CPU",
             "cuda": "GPU (CUDA)" + (" (非対応)" if not device_statuses["cuda"] else ""),
+            "xpu": "GPU (Intel XPU)" + (" (非対応)" if not device_statuses["xpu"] else ""),
             "npu": "NPU" + (" (非対応)" if not device_statuses["npu"] else ""),
         }
+        device_options = ["auto", "cpu", "cuda", "xpu", "npu"]
+        selected_device = (s().device or "auto").lower()
+        if selected_device == "gpu":
+            selected_device = "cuda"
+        if selected_device not in device_options:
+            selected_device = "auto"
         s().device = st.selectbox(
             "推論デバイス",
-            ["auto", "cpu", "cuda", "npu"],
-            index=["auto", "cpu", "cuda", "npu"].index(s().device if s().device else "auto"),
+            device_options,
+            index=device_options.index(selected_device),
             format_func=lambda value: device_labels[value],
         )
         unavailable_labels = []
         if not device_statuses["cuda"]:
             unavailable_labels.append("GPU (CUDA) はこの環境では非対応")
+        if not device_statuses["xpu"]:
+            unavailable_labels.append("GPU (Intel XPU) はこの環境では非対応")
         if not device_statuses["npu"]:
             unavailable_labels.append("NPU はこの環境では非対応")
         if unavailable_labels:
@@ -573,6 +623,7 @@ with st.sidebar:
 
 inject_styles()
 
+# 起動時に監視をつなぎ、必要ならバックグラウンド索引も始める。
 auto_index_manager.configure(s())
 ensure_startup_index(auto_index_manager)
 auto_index_status = auto_index_manager.get_status()
@@ -584,6 +635,7 @@ watch_state = "監視中" if auto_index_status.watching_path and docs_dir_exists
 
 @st.experimental_fragment(run_every=1)
 def render_loading_state() -> None:
+    # 起動直後のバックグラウンド索引だけは自動ポーリングで進捗を更新する。
     status = auto_index_manager.get_status()
     if not status.is_indexing:
         return
@@ -624,6 +676,7 @@ st.markdown(
 
 render_loading_state()
 
+# ここから下は、状態サマリー、手動更新、検索フォーム、検索結果の順に表示する。
 flow_cols = st.columns(3, gap="large")
 flow_items = [
     ("1", "文書を入れる", "検索したい Office ファイルや PDF を、対象フォルダへ入れてください。"),
@@ -695,13 +748,18 @@ with status_right:
             with progress_box.container():
                 render_progress_panel("手動更新の進捗", current, total, path, stage)
 
-        indexed, skipped, chunks, removed, note = auto_index_manager.run_now(
-            s(),
-            "manual",
-            progress_callback=update_progress,
-        )
-        progress_box.empty()
-        st.success(
+        try:
+            indexed, skipped, chunks, removed, note = auto_index_manager.run_now(
+                s(),
+                "manual",
+                progress_callback=update_progress,
+            )
+        except Exception as exc:
+            progress_box.empty()
+            st.error(f"手動更新に失敗しました: {exc}")
+        else:
+            progress_box.empty()
+            st.success(
             f"更新完了：索引化 {indexed} 件 / スキップ {skipped} 件 / "
             f"追加チャンク {chunks} 件 / 削除 {removed} 件（{note}）"
         )

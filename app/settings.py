@@ -23,14 +23,14 @@ class AppSettings:
     top_k_files: int = 5
     top_k_chunks: int = 12
 
-    # Device: "auto" | "cpu" | "cuda" | "npu"
+    # Device: "auto" | "cpu" | "cuda" | "xpu" | "npu"
     device: str = "auto"
 
     # UI上で「保存」できるようにするためJSON永続化
     @staticmethod
     def load(path: Path = DEFAULT_SETTINGS_PATH) -> "AppSettings":
         if path.exists():
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             valid_fields = {field.name for field in fields(AppSettings)}
             filtered = {key: value for key, value in data.items() if key in valid_fields}
             return AppSettings(**filtered)
